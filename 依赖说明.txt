@@ -1,0 +1,25 @@
+领克车机 ADB 工具 - 依赖说明
+================================
+
+1. Python 文件
+   - 只需要 lynk_adb_tool.py 一个文件。
+   - 代码只使用 Python 标准库：os / queue / re / subprocess / sys /
+     threading / time / tkinter。
+   - 不需要额外的 .py 模块，也不需要 pip 安装任何第三方包。
+
+2. Python 运行时
+   - Python 3.10 或更高版本。
+   - 必须包含 tkinter（Windows 官方安装包默认包含；安装时勾选 tcl/tk）。
+   - 启动器会优先使用 uv 自带的 pythonw.exe，其次使用 PATH 里的 pythonw.exe。
+
+3. 外部工具
+   - adb.exe：必需。放在 PATH，或 Android SDK platform-tools 目录。
+   - aapt2.exe：可选。只用于自动解析 APK 包名和启动入口；
+     没有它也能上传、安装，只是启动/卸载按钮需要手动填包名。
+
+4. 不需要的东西
+   - 不需要 Node.js、Java、Gradle、Android Studio。
+   - 不需要把 adb 或 aapt2 复制进本目录（程序会自动查找）。
+
+5. 自检
+   双击「检查环境.bat」，会打印 Python 版本、tkinter 状态、adb 和 aapt2 路径。

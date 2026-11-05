@@ -1,0 +1,2 @@
+# 本工具没有第三方 Python 依赖。
+# 只需要 Python 3.10+ 标准库中的 tkinter。

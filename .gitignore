@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# PyInstaller / 打包产物
+build/
+dist/
+release/
+*.zip
+
+# 不把车辆 APK、日志、临时文件提交进仓库
+*.apk
+*.log
+
+# adb / aapt2 二进制由发布脚本或 GitHub Actions 放入，不进源码仓库
+tools/adb/adb.exe
+tools/adb/AdbWinApi.dll
+tools/adb/AdbWinUsbApi.dll
+tools/aapt2/aapt2.exe
