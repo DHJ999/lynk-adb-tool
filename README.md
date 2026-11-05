@@ -12,8 +12,6 @@
 [![Downloads](https://img.shields.io/github/downloads/DHJ999/lynk-adb-tool/total?style=flat-square)](https://github.com/DHJ999/lynk-adb-tool/releases)
 [![Stars](https://img.shields.io/github/stars/DHJ999/lynk-adb-tool?style=flat-square)](https://github.com/DHJ999/lynk-adb-tool/stargazers)
 
-[**下载 Release**](https://github.com/DHJ999/lynk-adb-tool/releases/latest) · [**问题反馈**](https://github.com/DHJ999/lynk-adb-tool/issues)
-
 </div>
 
 > 在25款03osn2.0车机上测试使用编写。
@@ -28,6 +26,7 @@
 ## 功能
 
 - 一键上传、安装、启动、卸载 APK
+- 列出已安装应用（应用名 + 包名），支持输入包名卸载
 - 绕过车机 adbd 对 `install` 字符串的过滤
 - USB 断线自动重连，失败自动重试
 - 签名冲突时自动卸载旧版再安装
@@ -41,6 +40,9 @@
 3. 车机开启 USB 调试，连接 USB，弹窗点「允许」
 4. 选择 APK → **① 上传到车机** → **② 安装** → **③ 启动应用**
 5. 出问题点 **④ 抓日志**
+6. 要卸载软件点 **⑤ 应用列表**，可按应用名/包名搜索
+
+> 应用名需要读取 APK 资源，首次刷新会慢一些；勾选「包含系统应用」后会明显更慢。
 
 ## 为什么需要它
 
@@ -57,7 +59,8 @@
 需要 Windows 10/11 + Python 3.10+（带 tkinter）。
 
 ```text
-车机安装工具.bat     主启动器
+车机App安装工具.bat  主启动器（中文入口）
+run.bat              实际启动逻辑（桌面入口可直接调用）
 诊断启动.bat         带控制台启动，排错用
 检查环境.bat         检查 Python / tkinter / adb / aapt2
 lynk_adb_tool.py     主程序

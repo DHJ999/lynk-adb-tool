@@ -16,9 +16,11 @@ import queue
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
+import zipfile
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 APP_TITLE = "领克车机 ADB 工具"
@@ -104,11 +106,13 @@ def find_aapt2() -> str:
 class AdbClient:
     """带自动重连的 adb 封装。所有方法阻塞，必须放后台线程跑。"""
 
-    def __init__(self, adb_path: str, log):
+    def __init__(self, adb_path: str, log, aapt2: str = ""):
         self.adb = adb_path
         self.log = log
+        self.aapt2 = aapt2
         self.serial = None
         self.pushed_apk = None   # 最近一次成功上传到设备的本地 APK 绝对路径
+        self.label_cache = {}
 
     # ---------- 低层 ----------
     def _run(self, args, timeout=60):
@@ -117,7 +121,8 @@ class AdbClient:
             cmd[1:1] = ["-s", self.serial]
         try:
             p = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=timeout,
+                cmd, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=timeout,
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
             return p.returncode, (p.stdout or "") + (p.stderr or "")
@@ -187,6 +192,120 @@ class AdbClient:
         if len(lines) >= 2:
             return f"{lines[0]} · Android {lines[1]}"
         return "已连接"
+
+    def _pm_list(self, flag: str):
+        code, out = self.run_retry(
+            ["shell", "pm", "list", "packages", flag],
+            timeout=60, retries=2,
+        )
+        packages = set()
+        for line in out.splitlines():
+            if line.startswith("package:"):
+                packages.add(line.split(":", 1)[1].strip())
+        return packages
+
+    def list_apps(self, include_system=False, progress=None):
+        """返回 [(应用名, 包名, 用户/系统), ...]。"""
+        user = self._pm_list("-3")
+        system = self._pm_list("-s") if include_system else set()
+        packages = sorted(user | system)
+        total = len(packages)
+        rows = []
+
+        for index, pkg in enumerate(packages, 1):
+            kind = "系统" if pkg in system else "用户"
+            label = self.label_cache.get(pkg)
+            if label is None:
+                label = self.package_label(pkg)
+                self.label_cache[pkg] = label
+            rows.append((label or "—", pkg, kind))
+            if progress:
+                progress(index, total, pkg)
+        return rows
+
+    def package_label(self, pkg: str) -> str:
+        """用 AndroidManifest + resources.arsc 生成 mini APK，取应用名。"""
+        if not self.aapt2:
+            return ""
+
+        _, out = self.run_retry(
+            ["shell", "pm", "path", pkg], timeout=30, retries=1
+        )
+        apk = ""
+        for line in out.splitlines():
+            if line.startswith("package:") and line.rstrip().endswith("base.apk"):
+                apk = line.split(":", 1)[1].strip()
+                break
+        if not apk:
+            for line in out.splitlines():
+                if line.startswith("package:"):
+                    apk = line.split(":", 1)[1].strip()
+                    break
+        if not apk:
+            return ""
+
+        pid = os.getpid()
+        remote_manifest = f"/data/local/tmp/lynk_m_{pid}.xml"
+        remote_res = f"/data/local/tmp/lynk_r_{pid}.arsc"
+        extract = (
+            f"unzip -p '{apk}' AndroidManifest.xml > {remote_manifest} 2>/dev/null; "
+            f"unzip -p '{apk}' resources.arsc > {remote_res} 2>/dev/null"
+        )
+        self.run_retry(["shell", extract], timeout=60, retries=1)
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="lynk_label_") as td:
+                local_manifest = os.path.join(td, "AndroidManifest.xml")
+                local_res = os.path.join(td, "resources.arsc")
+                if self._pull_quiet(remote_manifest, local_manifest) and \
+                        self._pull_quiet(remote_res, local_res):
+                    mini = os.path.join(td, "mini.apk")
+                    try:
+                        with zipfile.ZipFile(mini, "w", zipfile.ZIP_DEFLATED) as z:
+                            z.write(local_manifest, "AndroidManifest.xml")
+                            z.write(local_res, "resources.arsc")
+                        label = self._aapt_label(mini)
+                        if label:
+                            return label
+                    except Exception:
+                        pass
+
+                # 少数设备没有 unzip：退回拉完整 base.apk
+                full = os.path.join(td, "base.apk")
+                if self._pull_quiet(apk, full):
+                    return self._aapt_label(full)
+                return ""
+        finally:
+            self._run(
+                ["shell", f"rm -f {remote_manifest} {remote_res}"],
+                timeout=10,
+            )
+
+    def _pull_quiet(self, remote: str, local: str) -> bool:
+        code, _ = self.run_retry(
+            ["pull", remote, local], timeout=180, retries=1
+        )
+        return code == 0 and os.path.isfile(local) and os.path.getsize(local) > 0
+
+    def _aapt_label(self, apk: str) -> str:
+        try:
+            p = subprocess.run(
+                [self.aapt2, "dump", "badging", apk],
+                capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=30,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+        except Exception:
+            return ""
+        default = ""
+        for line in (p.stdout or "").splitlines():
+            if line.startswith("application-label-zh-CN:"):
+                return line.split(":", 1)[1].strip().strip("'")
+            if line.startswith("application-label-zh:"):
+                default = line.split(":", 1)[1].strip().strip("'")
+            elif line.startswith("application-label:") and not default:
+                default = line.split(":", 1)[1].strip().strip("'")
+        return default
 
     def push(self, local_apk):
         size = os.path.getsize(local_apk)
@@ -312,7 +431,7 @@ class App:
         self.pushed_apk = None          # 已成功上传到设备的本地路径（防止装错旧包）
         self.force_reinstall = tk.BooleanVar(value=True)
         self.aapt2 = find_aapt2()
-        self.client = AdbClient(self.adb_path.get(), self.log)
+        self.client = AdbClient(self.adb_path.get(), self.log, self.aapt2)
 
         self._build_ui()
         self.root.after(120, self._drain_log)
@@ -390,6 +509,8 @@ class App:
         self.btn_uninstall.pack(side="left", padx=8)
         self.btn_logcat = ttk.Button(row4, text="④ 抓日志", command=self.on_logcat)
         self.btn_logcat.pack(side="right")
+        self.btn_apps = ttk.Button(row4, text="⑤ 应用列表", command=self.on_apps)
+        self.btn_apps.pack(side="right", padx=(0, 8))
 
         row5 = tk.Frame(apk, bg=PANEL)
         row5.pack(fill="x", padx=12, pady=(0, 4))
@@ -450,7 +571,7 @@ class App:
     def _set_busy(self, busy: bool):
         self.busy = busy
         state = "disabled" if busy else "normal"
-        for b in (self.btn_upload, self.btn_install):
+        for b in (self.btn_upload, self.btn_install, self.btn_apps):
             b.configure(state=state)
         if busy:
             self.pb.start(12)
@@ -525,7 +646,8 @@ class App:
     def _parse_apk(self, path):
         try:
             p = subprocess.run([self.aapt2, "dump", "badging", path],
-                               capture_output=True, text=True, timeout=30,
+                               capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=30,
                                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
             out = p.stdout or ""
             m = re.search(r"package: name='([^']+)'", out)
@@ -590,6 +712,11 @@ class App:
 
         threading.Thread(target=work, daemon=True).start()
 
+    def on_apps(self):
+        if self.busy:
+            return
+        AppListWindow(self)
+
     def on_logcat(self):
         if self.busy:
             return
@@ -627,6 +754,260 @@ class App:
         threading.Thread(target=lambda: (self.client.uninstall(self.pkg_name),
                                          self.root.after(0, lambda: self._set_busy(False))),
                          daemon=True).start()
+
+
+class AppListWindow(tk.Toplevel):
+    """已安装应用列表：应用名 + 包名，支持输入包名卸载。"""
+
+    def __init__(self, app: App):
+        super().__init__(app.root)
+        self.app = app
+        self.all_rows = []
+        self.loading = False
+        self._closed = False
+        self.pkg_var = tk.StringVar()
+        self.search_var = tk.StringVar()
+        self.include_system = tk.BooleanVar(value=False)
+
+        self.title("应用列表")
+        self.geometry("840x640")
+        self.minsize(720, 520)
+        self.configure(bg=BG)
+        self.transient(app.root)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+        self._build()
+        self.search_var.trace_add("write", lambda *_: self._apply_filter())
+        self.after(100, self.refresh)
+
+    def _build(self):
+        style = ttk.Style(self)
+        style.configure(
+            "App.Treeview",
+            background=PANEL2,
+            fieldbackground=PANEL2,
+            foreground=FG,
+            rowheight=27,
+            font=("Microsoft YaHei UI", 9),
+        )
+        style.configure(
+            "App.Treeview.Heading",
+            background=PANEL,
+            foreground=FG_DIM,
+            font=("Microsoft YaHei UI", 9, "bold"),
+        )
+        style.map(
+            "App.Treeview",
+            background=[("selected", "#2E4A56")],
+            foreground=[("selected", FG)],
+        )
+
+        top = tk.Frame(self, bg=BG)
+        top.pack(fill="x", padx=16, pady=(14, 6))
+        tk.Label(
+            top, text="应用列表", bg=BG, fg=FG,
+            font=("Microsoft YaHei UI", 16, "bold"),
+        ).pack(side="left")
+        tk.Label(
+            top, text="应用名从 APK 资源读取，首次会慢一些", bg=BG, fg=FG_DIM,
+            font=("Microsoft YaHei UI", 9),
+        ).pack(side="left", padx=12)
+
+        tools = tk.Frame(self, bg=PANEL)
+        tools.pack(fill="x", padx=16, pady=6, ipady=8)
+
+        tk.Label(
+            tools, text="搜索", bg=PANEL, fg=FG_DIM,
+            font=("Microsoft YaHei UI", 9),
+        ).pack(side="left", padx=(12, 6))
+        tk.Entry(
+            tools, textvariable=self.search_var, bg=PANEL2, fg=FG,
+            insertbackground=FG, relief="flat", font=("Consolas", 9), width=24,
+        ).pack(side="left", fill="x", expand=True)
+
+        self.btn_refresh = ttk.Button(tools, text="刷新列表", command=self.refresh)
+        self.btn_refresh.pack(side="left", padx=8)
+        tk.Checkbutton(
+            tools, text="包含系统应用（较慢）", variable=self.include_system,
+            command=self.refresh, bg=PANEL, fg=FG_DIM, selectcolor=PANEL2,
+            activebackground=PANEL, activeforeground=FG,
+            highlightthickness=0, font=("Microsoft YaHei UI", 9),
+        ).pack(side="left", padx=(0, 12))
+
+        tree_box = tk.Frame(self, bg=PANEL)
+        tree_box.pack(fill="both", expand=True, padx=16, pady=6)
+        self.tree = ttk.Treeview(
+            tree_box,
+            columns=("label", "pkg", "kind"),
+            show="headings",
+            style="App.Treeview",
+        )
+        self.tree.heading("label", text="应用名")
+        self.tree.heading("pkg", text="包名")
+        self.tree.heading("kind", text="类型")
+        self.tree.column("label", width=240, anchor="w")
+        self.tree.column("pkg", width=430, anchor="w")
+        self.tree.column("kind", width=70, anchor="center")
+
+        vsb = ttk.Scrollbar(tree_box, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=vsb.set)
+        self.tree.pack(side="left", fill="both", expand=True, padx=(0, 0))
+        vsb.pack(side="right", fill="y")
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.tree.bind("<Double-1>", self._on_double)
+
+        bottom = tk.Frame(self, bg=PANEL)
+        bottom.pack(fill="x", padx=16, pady=(6, 16), ipady=8)
+
+        row = tk.Frame(bottom, bg=PANEL)
+        row.pack(fill="x", padx=12, pady=(8, 4))
+        tk.Label(
+            row, text="包名", bg=PANEL, fg=FG_DIM,
+            font=("Microsoft YaHei UI", 9),
+        ).pack(side="left", padx=(0, 6))
+        tk.Entry(
+            row, textvariable=self.pkg_var, bg=PANEL2, fg=FG,
+            insertbackground=FG, relief="flat", font=("Consolas", 9),
+        ).pack(side="left", fill="x", expand=True)
+
+        self.btn_uninstall = ttk.Button(
+            row, text="卸载此包名", style="Accent.TButton", command=self.uninstall
+        )
+        self.btn_uninstall.pack(side="left", padx=8)
+        ttk.Button(row, text="复制包名", command=self.copy_pkg).pack(side="left")
+        ttk.Button(row, text="关闭", command=self.destroy).pack(side="left", padx=8)
+
+        self.status = tk.Label(
+            bottom, text="准备读取…", bg=PANEL, fg=FG_DIM,
+            font=("Microsoft YaHei UI", 9), anchor="w",
+        )
+        self.status.pack(fill="x", padx=12, pady=(2, 4))
+
+    def refresh(self):
+        if self.loading or self._closed:
+            return
+        self.loading = True
+        self.btn_refresh.configure(state="disabled")
+        self.status.configure(text="正在读取应用列表…")
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        include = self.include_system.get()
+        threading.Thread(target=self._load_worker, args=(include,), daemon=True).start()
+
+    def _load_worker(self, include_system: bool):
+        rows = []
+        error = None
+        try:
+            rows = self.app.client.list_apps(
+                include_system=include_system,
+                progress=self._progress,
+            )
+        except Exception as e:
+            error = e
+        if not self._closed:
+            self.after(0, lambda: self._load_done(rows, error))
+
+    def _progress(self, index: int, total: int, pkg: str):
+        if self._closed:
+            return
+        self.after(
+            0,
+            lambda: self.status.configure(
+                text=f"正在读取 {index}/{total}：{pkg}"
+            ),
+        )
+
+    def _load_done(self, rows, error):
+        if not self._alive():
+            return
+        self.loading = False
+        self.btn_refresh.configure(state="normal")
+        if error is not None:
+            self.status.configure(text=f"读取失败：{error}")
+            return
+        self.all_rows = rows
+        self._apply_filter()
+        self.status.configure(text=f"共 {len(rows)} 个应用")
+
+    def _apply_filter(self):
+        query = self.search_var.get().strip().lower()
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+        shown = 0
+        for label, pkg, kind in self.all_rows:
+            if query and query not in label.lower() and query not in pkg.lower():
+                continue
+            self.tree.insert("", "end", values=(label, pkg, kind))
+            shown += 1
+        if self.all_rows and not self.loading:
+            self.status.configure(
+                text=f"显示 {shown} / {len(self.all_rows)} 个应用"
+            )
+
+    def _selected_pkg(self) -> str:
+        selection = self.tree.selection()
+        if not selection:
+            return ""
+        values = self.tree.item(selection[0], "values")
+        return values[1] if len(values) > 1 else ""
+
+    def _on_select(self, _event=None):
+        pkg = self._selected_pkg()
+        if pkg:
+            self.pkg_var.set(pkg)
+
+    def _on_double(self, _event=None):
+        self._on_select()
+
+    def copy_pkg(self):
+        pkg = self.pkg_var.get().strip() or self._selected_pkg()
+        if not pkg:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(pkg)
+        self.status.configure(text=f"已复制：{pkg}")
+
+    def uninstall(self):
+        pkg = self.pkg_var.get().strip() or self._selected_pkg()
+        if not pkg:
+            messagebox.showwarning(APP_TITLE, "请先选择应用，或输入包名")
+            return
+        if not messagebox.askyesno(APP_TITLE, f"确认卸载 {pkg}？"):
+            return
+        self.btn_uninstall.configure(state="disabled")
+        self.status.configure(text=f"正在卸载 {pkg}…")
+        threading.Thread(
+            target=self._uninstall_worker, args=(pkg,), daemon=True
+        ).start()
+
+    def _uninstall_worker(self, pkg: str):
+        ok = self.app.client.uninstall(pkg)
+        if not self._closed:
+            self.after(0, lambda: self._uninstall_done(pkg, ok))
+
+    def _uninstall_done(self, pkg: str, ok: bool):
+        if not self._alive():
+            return
+        self.btn_uninstall.configure(state="normal")
+        if ok:
+            self.app.client.label_cache.pop(pkg, None)
+            self.status.configure(text=f"已卸载 {pkg}")
+            self.refresh()
+        else:
+            self.status.configure(text=f"卸载失败：{pkg}（详见主日志）")
+
+    def _alive(self) -> bool:
+        if self._closed:
+            return False
+        try:
+            return bool(self.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def _close(self):
+        self._closed = True
+        self.destroy()
 
 
 def main():
