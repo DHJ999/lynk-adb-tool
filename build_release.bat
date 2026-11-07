@@ -57,6 +57,7 @@ if defined ADB_DIR (
 
 copy /y README.md "%OUT%\" >nul
 copy /y LICENSE "%OUT%\" >nul
+if exist assets xcopy /e /i /y assets "%OUT%\assets" >nul
 
 if exist "release\LynkAdbTool-win64.zip" del /q "release\LynkAdbTool-win64.zip"
 powershell -NoProfile -Command "Compress-Archive -Path 'release\LynkAdbTool\*' -DestinationPath 'release\LynkAdbTool-win64.zip' -Force"
