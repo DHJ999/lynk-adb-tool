@@ -1,18 +1,16 @@
-<div align="center">
+<h1 align="center" id="lynk-adb-tool">领克8155车机 ADB 安装工具</h1>
 
-# 领克8155车机 ADB 安装工具
+<p align="center"><strong>领克8155车机 ADB 安装工具：Windows GUI，上传/安装/启动 APK。</strong></p>
 
-**领克8155车机 ADB 安装工具：Windows GUI，上传/安装/启动 APK。**
-
-[![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6?style=flat-square&logo=windows)](https://github.com/DHJ999/lynk-adb-tool)
-[![Python](https://img.shields.io/badge/python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
-[![Android](https://img.shields.io/badge/Android-11-3DDC84?style=flat-square&logo=android&logoColor=white)](https://www.android.com/)
-[![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
-[![Release](https://img.shields.io/github/v/release/DHJ999/lynk-adb-tool?style=flat-square&label=release)](https://github.com/DHJ999/lynk-adb-tool/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/DHJ999/lynk-adb-tool/total?style=flat-square)](https://github.com/DHJ999/lynk-adb-tool/releases)
-[![Stars](https://img.shields.io/github/stars/DHJ999/lynk-adb-tool?style=flat-square)](https://github.com/DHJ999/lynk-adb-tool/stargazers)
-
-</div>
+<p align="center">
+  <a href="https://github.com/DHJ999/lynk-adb-tool"><img src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6?style=flat-square&logo=windows" alt="Platform"></a>
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python"></a>
+  <a href="https://www.android.com/"><img src="https://img.shields.io/badge/Android-11-3DDC84?style=flat-square&logo=android&logoColor=white" alt="Android"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="License"></a>
+  <a href="https://github.com/DHJ999/lynk-adb-tool/releases/latest"><img src="https://img.shields.io/github/v/release/DHJ999/lynk-adb-tool?style=flat-square&label=release" alt="Release"></a>
+  <a href="https://github.com/DHJ999/lynk-adb-tool/releases"><img src="https://img.shields.io/github/downloads/DHJ999/lynk-adb-tool/total?style=flat-square" alt="Downloads"></a>
+  <a href="https://github.com/DHJ999/lynk-adb-tool/stargazers"><img src="https://img.shields.io/github/stars/DHJ999/lynk-adb-tool?style=flat-square" alt="Stars"></a>
+</p>
 
 > 在25款03 OSN2.0车机上测试使用编写。
 
@@ -104,10 +102,9 @@ release\LynkAdbTool-win64.zip
 本项目使用 [MIT License](LICENSE)。  
 分发的 Android platform-tools 归 Google 所有，遵循 Apache 2.0 许可。
 
-## 请我喝杯水
+## 讨杯水
 
-如果这个工具帮你省了时间，可以请我喝杯水。  
-完全自愿，不影响使用和更新。
+如果这个工具帮到了你，可以请我喝杯水。完全自愿，不影响使用和更新。
 
 <div align="center">
 
