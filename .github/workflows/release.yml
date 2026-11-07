@@ -46,6 +46,7 @@ jobs:
           Copy-Item "platform-tools\AdbWinUsbApi.dll" "$out\tools\adb\"
           Copy-Item "README.md" "$out\"
           Copy-Item "LICENSE" "$out\"
+          if (Test-Path "assets") { Copy-Item -Recurse "assets" "$out\" }
           Compress-Archive -Path "$out\*" -DestinationPath "LynkAdbTool-win64.zip" -Force
 
       - name: Upload build artifact

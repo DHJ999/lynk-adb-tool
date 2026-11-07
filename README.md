@@ -14,7 +14,7 @@
 
 </div>
 
-> 在25款03osn2.0车机上测试使用编写。
+> 在25款03 OSN2.0车机上测试使用编写。
 
 ## 下载即用
 
@@ -103,3 +103,25 @@ release\LynkAdbTool-win64.zip
 
 本项目使用 [MIT License](LICENSE)。  
 分发的 Android platform-tools 归 Google 所有，遵循 Apache 2.0 许可。
+
+## 请我喝杯水
+
+如果这个工具帮你省了时间，可以请我喝杯水。  
+完全自愿，不影响使用和更新。
+
+<div align="center">
+
+<table>
+  <tr>
+    <td align="center">
+      <img src="assets/donate/wechat.jpg" width="240" alt="微信赞赏码"><br>
+      <b>微信</b>
+    </td>
+    <td align="center">
+      <img src="assets/donate/alipay.jpg" width="240" alt="支付宝赞赏码"><br>
+      <b>支付宝</b>
+    </td>
+  </tr>
+</table>
+
+</div>
