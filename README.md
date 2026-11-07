@@ -14,6 +14,12 @@
 
 > 在25款03 OSN2.0车机上测试使用编写。
 
+<p align="center">
+  <img src="assets/screenshots/main.png" alt="软件主页面" width="760">
+</p>
+
+<p align="center"><sub>软件主页面</sub></p>
+
 ## 下载即用
 
 从 [Releases](https://github.com/DHJ999/lynk-adb-tool/releases/latest) 下载
