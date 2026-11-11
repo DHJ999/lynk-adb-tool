@@ -13,6 +13,8 @@ release/
 # 不把车辆 APK、日志、临时文件提交进仓库
 *.apk
 *.log
+logs/
+label_cache.json
 
 # adb / aapt2 二进制由发布脚本或 GitHub Actions 放入，不进源码仓库
 tools/adb/adb.exe

@@ -12,7 +12,7 @@
   <a href="https://github.com/DHJ999/lynk-adb-tool/stargazers"><img src="https://img.shields.io/github/stars/DHJ999/lynk-adb-tool?style=flat-square" alt="Stars"></a>
 </p>
 
-> 在25款03 OSN2.0车机上测试使用编写。
+> 在 25 款领克 03（OSN 2.0，车机代号 CS11 / geely_fx11，8155 平台）上测试编写。
 
 ## 免责声明
 
@@ -34,7 +34,7 @@
 从 [Releases](https://github.com/DHJ999/lynk-adb-tool/releases/latest) 下载
 `LynkAdbTool-win64.zip`，解压后双击 `LynkAdbTool.exe`。
 
-发布包已内置 adb，**不需要安装 Python，也不需要 Android SDK**。
+发布包已内置 adb 与 aapt2，**不需要安装 Python，也不需要 Android SDK**。
 
 ## 功能
 
@@ -43,8 +43,9 @@
 - 绕过车机 adbd 对 `install` 字符串的过滤
 - USB 断线自动重连，失败自动重试
 - 签名冲突时自动卸载旧版再安装
-- 上传后校验设备端文件大小，避免半截包
+- 上传进度按 adb 实际传输百分比显示，结束后校验设备端文件大小，避免半截包
 - 一键抓取 logcat 到本地
+- 界面配色跟随系统深浅色，切换后自动重建
 
 ## 快速开始
 
@@ -64,7 +65,7 @@
 | 坑 | 现象 | 本工具的处理 |
 |---|---|---|
 | adbd 过滤命令里的 `install` | `adb install` / `pm install` 返回 `error: closed` | 用 `ins''tall` 引号拼接绕过 |
-| USB 链路不稳 | 随机 `error: closed` / `offline` | 自动 `kill-server` 重连，失败重试 3 次 |
+| USB 链路不稳 | 随机 `error: closed` / `offline` | 先温和 `reconnect`，判明确实掉线才 `kill-server` 重启，并重试 3 次 |
 | 车机 ADB 重启后关闭 | `adb devices` 为空 | 「重新检测」重新握手 |
 
 ## 从源码运行
@@ -73,13 +74,20 @@
 
 ```text
 run.bat              主启动器（双击即用，自动找带 tkinter 的 Python）
-诊断启动.bat         带控制台启动，打不开时排错用
-build_release.bat    打包发布（PyInstaller + 内置 adb + zip）
+诊断启动.bat         带控制台启动并先跑自检，打不开时排错用
+build_release.bat    打包发布（PyInstaller + 内置 adb/aapt2 + zip）
 lynk_adb_tool.py     主程序
 ```
 
-adb 会自动从 `tools\adb\`、Android SDK 或 PATH 查找，也可以在界面里手动指定。
-aapt2 是可选的，只用于自动解析 APK 包名。
+启动器会自动枚举便携 `python\`、uv 安装目录和 PATH，不再依赖写死的版本号；
+找不到带 tkinter 的 Python 时会明确提示，而不是闪退。
+
+adb 会自动从 `tools\adb\`、Android SDK 或 PATH 查找，aapt2 会从 `tools\aapt2\`、
+SDK 的 `build-tools` 查找（也可用环境变量 `LYNK_AAPT2` 直接指定），也可以在界面里手动指定 adb。
+命令行运行 `python lynk_adb_tool.py --selftest` 可快速查看两者的解析结果。
+
+运行时会生成 `logs\`（logcat 落盘）和 `label_cache.json`（应用名缓存），两者都已在
+`.gitignore` 中忽略，不会进仓库。
 
 ## 自己打包
 
@@ -100,7 +108,7 @@ release\LynkAdbTool-win64.zip
 ## 常见问题
 
 **双击后没反应、闪退，或提示缺模块？**  
-双击 `诊断启动.bat`，它会用带控制台的 `python.exe` 启动并显示完整报错。
+双击 `诊断启动.bat`，它会先用带控制台的 `python.exe` 打印自检结果，再启动程序并显示完整报错。
 
 **adb 显示 offline？**  
 软件里开关 USB 调试通常无效。请在车机端拔插 USB，或重启车机，再点「重新检测」。
@@ -111,7 +119,8 @@ release\LynkAdbTool-win64.zip
 避免装错/卸错设备。
 
 **没有 aapt2？**  
-不影响上传和安装，只是启动/卸载需要手动填包名。
+发布包已内置，免安装版不受影响。从源码运行时程序会自动在 SDK 的 `build-tools` 里找；
+一个都没有时仍可上传、安装、按包名卸载，只是「② 启动应用」不可用、应用名显示为「—」。
 
 ## 许可证
 

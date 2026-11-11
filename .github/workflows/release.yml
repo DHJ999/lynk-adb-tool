@@ -33,6 +33,22 @@ jobs:
           Invoke-WebRequest -Uri "https://dl.google.com/android/repository/platform-tools-latest-windows.zip" -OutFile "platform-tools.zip"
           Expand-Archive -Path "platform-tools.zip" -DestinationPath "."
 
+      # aapt2 决定「应用名」和「② 启动应用」是否可用；发布包必须自带，
+      # 否则没装 Android SDK 的用户拿到后启动按钮永远是灰的（aapt2.exe 单文件即可运行）
+      - name: Download aapt2 (build-tools)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://dl.google.com/android/repository/build-tools_r34-windows.zip" -OutFile "build-tools.zip"
+          Expand-Archive -Path "build-tools.zip" -DestinationPath "bt"
+          $aapt2 = Get-ChildItem -Path "bt" -Recurse -Filter "aapt2.exe" | Select-Object -First 1
+          if (-not $aapt2) { throw "aapt2.exe not found in build-tools archive" }
+          New-Item -ItemType Directory -Force -Path "aapt2" | Out-Null
+          Copy-Item $aapt2.FullName "aapt2\aapt2.exe"
+          & "aapt2\aapt2.exe" version
+
+      - name: Smoke test
+        run: python lynk_adb_tool.py --selftest
+
       - name: Build exe
         run: python -m PyInstaller --noconfirm --clean LynkAdbTool.spec
 
@@ -41,9 +57,11 @@ jobs:
         run: |
           $out = "dist\LynkAdbTool"
           New-Item -ItemType Directory -Force -Path "$out\tools\adb" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$out\tools\aapt2" | Out-Null
           Copy-Item "platform-tools\adb.exe" "$out\tools\adb\"
           Copy-Item "platform-tools\AdbWinApi.dll" "$out\tools\adb\"
           Copy-Item "platform-tools\AdbWinUsbApi.dll" "$out\tools\adb\"
+          Copy-Item "aapt2\aapt2.exe" "$out\tools\aapt2\"
           Copy-Item "README.md" "$out\"
           Copy-Item "LICENSE" "$out\"
           if (Test-Path "assets") { Copy-Item -Recurse "assets" "$out\" }
