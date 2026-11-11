@@ -21,3 +21,6 @@ tools/adb/adb.exe
 tools/adb/AdbWinApi.dll
 tools/adb/AdbWinUsbApi.dll
 tools/aapt2/aapt2.exe
+
+# 原始素材（带 EXIF/GPS 的原图与大体积视频）只留本地，入库的是 assets/car/ 里压过的版本
+assets/Lynk&Co 03/
