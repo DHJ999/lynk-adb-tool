@@ -80,14 +80,17 @@ def make_button(parent, text, command, accent=False, danger=False):
                   activebackground=hbg, activeforeground=fg, relief="flat", bd=0,
                   padx=14, pady=6, highlightthickness=0, cursor="hand2",
                   font=("Microsoft YaHei UI", 10, "bold") if accent else ("Microsoft YaHei UI", 10))
-    b._bg, b._fg = bg, fg
-    b.bind("<Enter>", lambda _e: b.configure(bg=hbg))
-    b.bind("<Leave>", lambda _e: b.configure(bg=b._bg))
+    b._bg, b._fg, b._hbg = bg, fg, hbg
+    b._enabled = True
+    # 禁用态不参与 hover，否则鼠标划过再移开会把按钮刷回正常配色，看着像没禁用
+    b.bind("<Enter>", lambda _e: b._enabled and b.configure(bg=b._hbg))
+    b.bind("<Leave>", lambda _e: b._enabled and b.configure(bg=b._bg))
     return b
 
 
 def set_enabled(b, enabled: bool):
     """禁用时降为暗色，恢复时回到按钮自己的配色。"""
+    b._enabled = enabled
     if enabled:
         b.configure(state="normal", bg=b._bg, fg=b._fg)
     else:
@@ -180,17 +183,31 @@ def find_adb() -> str:
 
 
 def find_aapt2() -> str:
-    """从 SDK build-tools 里找最新的 aapt2，用来解析包名。"""
+    """从 SDK build-tools 里找最新的 aapt2，用来解析包名。
+    查找顺序：环境变量 LYNK_AAPT2 → 程序自带 tools\\aapt2 → 各 SDK 的 build-tools 最新版。"""
+    env = os.environ.get("LYNK_AAPT2", "").strip()
+    if env and os.path.isfile(env):
+        return env
+
     local = os.path.join(APP_DIR, "tools", "aapt2", "aapt2.exe")
     if os.path.isfile(local):
         return local
 
     sdk_roots = [
         os.path.expandvars(r"%ANDROID_HOME%"),
+        os.path.expandvars(r"%ANDROID_SDK_ROOT%"),
         os.path.expandvars(r"%LOCALAPPDATA%\Android\Sdk"),
         r"D:\Android\Sdk",
         r"C:\Android\Sdk",
+        r"E:\Android\Sdk",
     ]
+    # 顺带按「adb 所在目录的父级 / 同级」推测，覆盖 SDK 被改名或放在非标准盘的情况
+    adb = find_adb()
+    if os.path.isfile(adb):
+        adb_dir = os.path.dirname(adb)
+        sdk_roots.append(os.path.dirname(adb_dir))           # <sdk>/platform-tools
+        sdk_roots.append(os.path.join(os.path.dirname(adb_dir), "sdk"))
+
     best, best_ver = "", (-1, -1, -1)
     for root in sdk_roots:
         if not root:
@@ -212,6 +229,34 @@ def find_aapt2() -> str:
     return best
 
 
+# adb devices 行尾可能出现的合法状态词；用来挡掉 daemon 提示行等噪声
+DEVICE_STATES = {
+    "device", "offline", "unauthorized", "authorizing", "connecting",
+    "bootloader", "recovery", "rescue", "sideload", "host", "no", "unknown",
+}
+
+
+def parse_devices(out: str):
+    """解析 `adb devices` 输出 → [(serial, state), ...]。
+
+    adb 启动守护进程时会往输出里掺 `* daemon not running...` / `* daemon started
+    successfully`，另外还有 `List of devices attached` 表头。这些行不能当成设备，
+    否则会冒出 serial 为 "*" 的幽灵设备，导致误弹设备选择框。
+    """
+    rows = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or line.startswith("*") or line.startswith("List of devices"):
+            continue
+        if "daemon" in line:
+            continue
+        parts = line.split()
+        if len(parts) < 2 or parts[1] not in DEVICE_STATES:
+            continue
+        rows.append((parts[0], parts[1]))
+    return rows
+
+
 class AdbClient:
     """带自动重连的 adb 封装。所有方法阻塞，必须放后台线程跑。"""
 
@@ -221,7 +266,6 @@ class AdbClient:
         self.aapt2 = aapt2
         self.serial = None
         self.model = ""          # 当前目标设备型号（卸载确认时展示，防打错设备）
-        self.pushed_apk = None   # 最近一次成功上传到设备的本地 APK 绝对路径
         self.label_cache = {}    # {包名: 应用名}，落盘到 label_cache.json，重开秒出
         self.cache_file = os.path.join(APP_DIR, "label_cache.json")
         try:
@@ -289,11 +333,7 @@ class AdbClient:
         states = {}
         while time.time() < deadline:
             code, out = self._run(["devices"], timeout=15)
-            states = {}
-            for line in out.splitlines()[1:]:
-                parts = line.split()
-                if len(parts) >= 2:
-                    states[parts[0]] = parts[1]
+            states = dict(parse_devices(out))
             if "device" in states.values():
                 return states
             time.sleep(2)
@@ -337,12 +377,7 @@ class AdbClient:
     def list_devices(self):
         """[(serial, state), ...]"""
         code, out = self._run(["devices"], timeout=15)
-        rows = []
-        for line in out.splitlines()[1:]:
-            parts = line.split()
-            if len(parts) >= 2 and parts[1] != "*":
-                rows.append((parts[0], parts[1]))
-        return rows
+        return parse_devices(out)
 
     def query_model(self, serial: str):
         """查询指定设备的型号。返回 (型号, 是否领克车机)。"""
@@ -466,12 +501,15 @@ class AdbClient:
         if not apk:
             return ""
 
-        pid = os.getpid()
-        remote_manifest = f"/data/local/tmp/lynk_m_{pid}.xml"
-        remote_res = f"/data/local/tmp/lynk_r_{pid}.arsc"
+        # 设备端临时文件名必须唯一：取标签是 6 线程并发跑的，
+        # 若只用 pid（进程级）命名，各线程会抢写同一个文件、并在 finally 里互删。
+        safe_pkg = re.sub(r"[^0-9A-Za-z._-]", "_", pkg)[:40]
+        tag = f"{safe_pkg}_{threading.get_ident()}"
+        remote_manifest = f"/data/local/tmp/lynk_{tag}_m.xml"
+        remote_res = f"/data/local/tmp/lynk_{tag}_r.arsc"
         extract = (
-            f"unzip -p '{apk}' AndroidManifest.xml > {remote_manifest} 2>/dev/null; "
-            f"unzip -p '{apk}' resources.arsc > {remote_res} 2>/dev/null"
+            f"unzip -p '{apk}' AndroidManifest.xml > '{remote_manifest}' 2>/dev/null; "
+            f"unzip -p '{apk}' resources.arsc > '{remote_res}' 2>/dev/null"
         )
         self.run_retry(["shell", extract], timeout=60, retries=1)
 
@@ -499,7 +537,7 @@ class AdbClient:
                 return ""
         finally:
             self._run(
-                ["shell", f"rm -f {remote_manifest} {remote_res}"],
+                ["shell", f"rm -f '{remote_manifest}' '{remote_res}'"],
                 timeout=10,
             )
 
@@ -530,10 +568,13 @@ class AdbClient:
         return default
 
     def push(self, local_apk, progress=None):
-        """上传 APK。progress 回调传 0~100 整数百分比（轮询设备端已写入大小），
-        失败时清理设备端残留的半截文件。"""
+        """上传 APK。progress 回调传 0~100 整数百分比（解析 adb push 自带的
+        `[ 45%]` 输出），失败时清理设备端残留的半截文件。
+
+        这里刻意不再用 `adb shell stat` 轮询设备端大小：progress 回调传的是
+        真实的传输百分比，且不会在本就不稳的 USB 链路上再开一条并发通道。
+        """
         size = os.path.getsize(local_apk)
-        self.pushed_apk = None
         self.log(f"上传 {os.path.basename(local_apk)}（{size / 1048576:.1f} MB）→ {REMOTE_APK}")
 
         cmd = [self.adb]
@@ -546,26 +587,38 @@ class AdbClient:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, encoding="utf-8", errors="replace",
                                     creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
-            stop = threading.Event()
+            chunks = []
+            last_pct = [-1]
 
-            def poll_remote():
-                """push 进程活着时，每 0.5s 读一次设备端已写入大小。"""
-                while not stop.is_set() and proc.poll() is None:
-                    code, out = self._run(["shell", f"stat -c %s {REMOTE_APK}"], timeout=10)
-                    for line in out.splitlines():
-                        if line.strip().isdigit() and progress and size:
-                            progress(min(100, int(line.strip()) * 100 // size))
-                    time.sleep(0.5)
+            def pump():
+                """边读边解析进度，同时把管道排空（否则输出多了会卡住 adb）。"""
+                tail = ""
+                while True:
+                    chunk = proc.stdout.read(256) if proc.stdout else ""
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    tail = (tail + chunk)[-200:]
+                    hit = None
+                    for m in re.finditer(r"\[\s*(\d{1,3})%\]", tail):
+                        hit = int(m.group(1))
+                    if hit is not None and hit != last_pct[0]:
+                        last_pct[0] = hit
+                        if progress:
+                            progress(min(99, hit))
 
-            pt = threading.Thread(target=poll_remote, daemon=True)
-            pt.start()
+            reader = threading.Thread(target=pump, daemon=True)
+            reader.start()
             try:
                 proc.wait(timeout=600)
             except subprocess.TimeoutExpired:
                 proc.kill()
+                try:
+                    proc.wait(timeout=10)
+                except Exception:
+                    pass
             finally:
-                stop.set()
-                pt.join(timeout=2)
+                reader.join(timeout=5)
 
             if proc.returncode == 0:
                 # 设备端核对大小，防止半截文件被当成装好了
@@ -580,12 +633,13 @@ class AdbClient:
                     self.log(f"✗ 上传不完整：设备端 {remote_size} 字节 / 本地 {size} 字节")
                     self.cleanup_remote(REMOTE_APK)
                     return False
-                self.pushed_apk = os.path.abspath(local_apk)
+                if progress:
+                    progress(100)
                 self.log("✓ 上传完成")
                 return True
 
-            last_err = (proc.stdout.read() if proc.stdout else "") or f"exit={proc.returncode}"
-            last_err = last_err.strip().splitlines()[-1] if last_err.strip() else "未知错误"
+            last_err = "".join(chunks).strip()
+            last_err = last_err.splitlines()[-1] if last_err else f"exit={proc.returncode}"
             if not self._is_link_error(last_err) or attempt == 2:
                 break
             self.log(f"⚠ 链路中断（{last_err}），第 {attempt + 1} 次自动重连…")
@@ -636,10 +690,15 @@ class AdbClient:
         return False, reason
 
     def uninstall(self, pkg, quiet=False):
+        # 包名要拼进 shell 命令，先做白名单校验：aapt2 解析出的字符串若不合法，
+        # 像 "x; rm -rf /" 这种会被带到设备端执行。
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+", pkg or ""):
+            self.log(f"✗ 包名不合法，已拒绝执行：{pkg!r}")
+            return False
         if not quiet:
             self.log(f"卸载 {pkg} …")
         code, out = self.run_retry(
-            ["shell", "pm unin''stall " + pkg], timeout=120, retries=2
+            ["shell", "pm unin''stall '" + pkg + "'"], timeout=120, retries=2
         )
         ok = "Success" in out or "not installed" in out.lower()
         if ok:
@@ -652,17 +711,18 @@ class AdbClient:
     def logcat(self, lines=1500):
         """抓最近若干行日志（先落设备文件再拉，避免 USB 大输出断链）。"""
         self.log(f"抓取日志（最近 {lines} 行）…")
-        cmd = f"logcat -d -t {lines} > /data/local/tmp/lc.txt"
+        remote = f"/data/local/tmp/lc_{int(time.time())}.txt"   # 每次唯一，避免并发互踩
+        cmd = f"logcat -d -t {lines} > {remote}"
         self.run_retry(["shell", cmd], timeout=120, retries=2)
         code, out = self.run_retry(
-            ["shell", "wc -l /data/local/tmp/lc.txt"], timeout=30, retries=2
+            ["shell", f"wc -l {remote}"], timeout=30, retries=2
         )
         self.log(f"设备端日志行数：{out.strip()}")
-        return "/data/local/tmp/lc.txt"
+        return remote
 
     def cleanup_remote(self, path):
         """拉取完成后清掉设备端临时文件，避免 /data/local/tmp 堆垃圾。"""
-        self._run(["shell", f"rm -f {path}"], timeout=15)
+        self._run(["shell", f"rm -f '{path}'"], timeout=15)
 
     def pull(self, remote, local):
         self.log(f"拉取 {remote} → {local}")
@@ -697,7 +757,8 @@ class App:
         self.adb_path = tk.StringVar(value=find_adb())
         self.pkg_name = ""
         self.launch_component = ""
-        self.pushed_apk = None          # 已成功上传到设备的本地路径（防止装错旧包）
+        # 状态栏当前文字/颜色：主题热切换要重建界面，重建后靠这两项还原
+        self._state_text, self._state_color = "检测中…", AMBER
         self.force_reinstall = tk.BooleanVar(value=True)
         self.aapt2 = find_aapt2()
         self.client = AdbClient(self.adb_path.get(), self.log, self.aapt2)
@@ -785,7 +846,7 @@ class App:
         row5 = tk.Frame(apk, bg=PANEL)
         row5.pack(fill="x", padx=12, pady=(0, 4))
         tk.Checkbutton(
-            row5, text="覆盖安装（签名不同则先卸载旧版再装）",
+            row5, text="签名冲突时自动卸载旧版再装（重签名包常见）",
             variable=self.force_reinstall, bg=PANEL, fg=FG_DIM,
             selectcolor=PANEL2, activebackground=PANEL, activeforeground=FG,
             highlightthickness=0, font=("Microsoft YaHei UI", 9),
@@ -839,7 +900,13 @@ class App:
         self.root.after(120, self._drain_log)
 
     def _set_state(self, text, color):
-        self.lbl_state.configure(text=f"● {text}", fg=color)
+        # 先落盘再画：主题热切换重建界面后要用它还原状态栏（原先只 configure
+        # 不保存，重建时会读到不存在的属性而崩溃）
+        self._state_text, self._state_color = text, color
+        try:
+            self.lbl_state.configure(text=f"● {text}", fg=color)
+        except tk.TclError:
+            pass
 
     def _set_busy(self, busy: bool):
         self.busy = busy
@@ -864,7 +931,8 @@ class App:
             return
         set_theme_globals(dark)
         IS_DARK = dark
-        state_text, state_color = self._state_text, self._state_color
+        state_text = getattr(self, "_state_text", "已连接")
+        state_color = getattr(self, "_state_color", ACCENT)
         history = list(self._log_history)
         for w in self.root.winfo_children():
             w.destroy()
@@ -876,40 +944,51 @@ class App:
         self._set_state(state_text, state_color)
 
     def _select_device(self):
-        """设备选择规则：唯一领克车机 → 直连；非车机或多设备 → 弹窗让用户选。"""
+        """设备选择规则：唯一领克车机 → 直连；非车机或多设备 → 弹窗让用户选。
+
+        探测放后台线程：每台设备要跑一次 getprop（宁可等 20s 也不能冻界面），
+        只有「弹选择框」这一步必须回主线程做。
+        """
         self.client.adb = self.adb_path.get()
-        devices = self.client.list_devices()
+        self._set_busy(True)
+        self._set_state("检测中…", AMBER)
+        threading.Thread(target=self._detect_worker, daemon=True).start()
+
+    def _detect_worker(self):
+        try:
+            self._detect_worker_inner()
+        except Exception as e:      # 任何意外都要解 busy，否则界面永久卡在"检测中"
+            self.root.after(0, lambda: self._detect_failed(f"检测失败：{e}"))
+
+    def _detect_worker_inner(self):
+        client = self.client
+        devices = client.list_devices()
         online = [s for s, st in devices if st == "device"]
         if not online:
-            # 没有在线设备：后台修复 adb server 后再试一次
-            self._set_busy(True)
-            self._set_state("检测中…", AMBER)
-
-            def revive():
-                ok, info = self.client._health()
-
-                def done():
-                    self._set_busy(False)
-                    if ok:
-                        self._select_device()
-                    else:
-                        self.lbl_dev.configure(text="—")
-                        self._set_state("未连接", RED)
-                        self.log(f"✗ {info}")
-
-                self.root.after(0, done)
-
-            threading.Thread(target=revive, daemon=True).start()
-            return
+            # 没有在线设备：后台修复 adb 链路后再看一次
+            ok, info = client._health()
+            if ok:
+                online = [s for s, st in client.list_devices() if st == "device"]
+            if not online:
+                self.root.after(0, lambda: self._detect_failed(info))
+                return
 
         infos = []
         for s in online:
-            model, is_lynk = self.client.query_model(s)
+            model, is_lynk = client.query_model(s)
             tag = "领克车机" if is_lynk else (
                 "本机模拟器（非USB设备）" if s.startswith("emulator-") else "非领克设备")
             infos.append((s, model, is_lynk, tag))
-        lynk = [i for i in infos if i[2]]
+        self.root.after(0, lambda: self._detect_done(infos))
 
+    def _detect_failed(self, info):
+        self._set_busy(False)
+        self.lbl_dev.configure(text="—")
+        self._set_state("未连接", RED)
+        self.log(f"✗ {info}")
+
+    def _detect_done(self, infos):
+        lynk = [i for i in infos if i[2]]
         if len(infos) == 1 and lynk:
             self._connect(infos[0][0], infos[0][1])
             return
@@ -920,6 +999,7 @@ class App:
         if dlg.chosen:
             self._connect(dlg.chosen, dlg.chosen_model)
         else:
+            self._set_busy(False)
             self.lbl_dev.configure(text="—")
             self._set_state("未选择设备", AMBER)
             self.log("⚠ 未选择设备")
@@ -927,15 +1007,27 @@ class App:
     def _connect(self, serial, model):
         self.client.serial = serial
         self.client.model = model
-        dinfo = self.client.device_info()
-        self.lbl_dev.configure(text=f"{dinfo}  ({serial})")
-        self._set_state("已连接", ACCENT)
-        self.log(f"✓ 已连接：{dinfo}（序列号 {serial}，{model}）")
-        self.log(f"adb: {self.adb_path.get()}")
-        if self.aapt2:
-            self.log(f"aapt2: {self.aapt2}")
-        else:
-            self.log("⚠ 未找到 aapt2，无法自动解析包名（启动/卸载按钮不可用）")
+        self.lbl_dev.configure(text=f"{model}  ({serial})")
+        self._set_state("连接中…", AMBER)
+
+        def work():
+            dinfo = self.client.device_info()   # 又一次 adb 往返，照样放后台
+
+            def done():
+                self.lbl_dev.configure(text=f"{dinfo}  ({serial})")
+                self._set_state("已连接", ACCENT)
+                self.log(f"✓ 已连接：{dinfo}（序列号 {serial}，{model}）")
+                self.log(f"adb: {self.adb_path.get()}")
+                if self.aapt2:
+                    self.log(f"aapt2: {self.aapt2}")
+                else:
+                    self.log("⚠ 未找到 aapt2，无法自动解析包名（启动按钮不可用，"
+                             "卸载仍可在应用列表里按包名操作）")
+                self._set_busy(False)
+
+            self.root.after(0, done)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _boot(self):
         self.log("正在检测 adb 与车机…")
@@ -961,7 +1053,6 @@ class App:
         self.apk_path.set(p)
         self.pkg_name = ""
         self.launch_component = ""
-        self.client.pushed_apk = None      # 换了文件，设备上的旧包作废
         set_enabled(self.btn_launch, False)
         if self.aapt2:
             threading.Thread(target=self._parse_apk, args=(p,), daemon=True).start()
@@ -1227,7 +1318,9 @@ class AppListWindow(tk.Toplevel):
         )
         self.btn_uninstall.pack(side="left", padx=8)
         make_button(row, "复制包名", self.copy_pkg).pack(side="left")
-        make_button(row, "关闭", self.destroy).pack(side="left", padx=8)
+        # 必须走 _close：直接 destroy 不会置 _closed，加载中关闭会让进度回调
+        # 一直往已销毁的控件上写字（一堆 TclError）
+        make_button(row, "关闭", self._close).pack(side="left", padx=8)
 
         self.status = tk.Label(
             bottom, text="准备读取…", bg=PANEL, fg=FG_DIM,
@@ -1267,12 +1360,12 @@ class AppListWindow(tk.Toplevel):
     def _progress(self, index: int, total: int, pkg: str):
         if self._closed:
             return
-        self.after(
-            0,
-            lambda: self.status.configure(
-                text=f"正在读取 {index}/{total}：{pkg}"
-            ),
-        )
+
+        def upd():
+            if self._alive():      # 窗口可能已在读取过程中被关掉
+                self.status.configure(text=f"正在读取 {index}/{total}：{pkg}")
+
+        self.after(0, upd)
 
     def _load_done(self, rows, error):
         # 先释放主窗口互斥（即使窗口已关闭也要释放，否则主界面按钮永久禁用）
