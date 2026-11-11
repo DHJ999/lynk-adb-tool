@@ -25,6 +25,7 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 APP_TITLE = "领克车机 ADB 工具"
 REMOTE_APK = "/data/local/tmp/upload.apk"
+FEEDBACK_EMAIL = "hjd2002@yeah.net"
 
 # 主题：跟随 Windows 显示模式（注册表 AppsUseLightTheme，0=深色）
 def detect_dark_mode() -> bool:
@@ -137,16 +138,18 @@ def enable_dpi_awareness():
             pass
 
 
-def window_icon():
-    """窗口图标路径：源码运行在 assets/，打包后在 _internal/assets/。"""
-    local = os.path.join(APP_DIR, "assets", "icon.ico")
-    if os.path.isfile(local):
-        return local
-    if getattr(sys, "frozen", False):
-        p = os.path.join(getattr(sys, "_MEIPASS", APP_DIR), "assets", "icon.ico")
+def asset_path(*parts) -> str:
+    """资源文件路径：源码运行时在 APP_DIR，PyInstaller 打包后在 _MEIPASS。"""
+    for base in (APP_DIR, getattr(sys, "_MEIPASS", APP_DIR)):
+        p = os.path.join(base, *parts)
         if os.path.isfile(p):
             return p
     return ""
+
+
+def window_icon():
+    """窗口图标路径：源码运行在 assets/，打包后在 _internal/assets/。"""
+    return asset_path("assets", "icon.ico")
 
 
 def apply_window_icon(window):
@@ -855,6 +858,18 @@ class App:
         self.pb = ttk.Progressbar(apk, mode="indeterminate")
         self.pb.pack(fill="x", padx=12, pady=(2, 6))
 
+        # 底栏：adb 路径 + 反馈 / 赞赏入口。
+        # 必须先用 side="bottom" 占位，再放会 expand 的日志区：pack 是按顺序分配空间的，
+        # 排在 expand 控件之后的 widget 在窗口不够高时会被压成 0 高度（按钮直接看不见）。
+        foot = tk.Frame(r, bg=BG)
+        foot.pack(side="bottom", fill="x", padx=16, pady=(0, 8))
+        tk.Label(foot, text=f"adb: {self.adb_path.get()}", bg=BG, fg=FG_DIM,
+                 font=("Consolas", 8), anchor="w").pack(side="left")
+        self.btn_donate = make_button(foot, "赞赏", self.on_donate)
+        self.btn_donate.pack(side="right")
+        self.btn_feedback = make_button(foot, "反馈", self.on_feedback)
+        self.btn_feedback.pack(side="right", padx=(0, 8))
+
         # 日志（终端屏：更深的底色 + 内嵌边）
         box = flat_panel(r)
         box.pack(fill="both", expand=True, padx=16, pady=(6, 4))
@@ -862,15 +877,12 @@ class App:
                  font=("Microsoft YaHei UI", 9), anchor="w").pack(fill="x", padx=12, pady=(8, 0))
         self.logbox = scrolledtext.ScrolledText(
             box, bg=PANEL2, fg=FG, insertbackground=FG, relief="flat",
-            font=("Consolas", 9), state="disabled", wrap="word",
+            font=("Consolas", 9), state="disabled", wrap="word", height=10,
         )
         self.logbox.pack(fill="both", expand=True, padx=12, pady=(2, 12))
         for tag, color in (("ok", ACCENT), ("err", RED), ("warn", AMBER)):
             self.logbox.tag_config(tag, foreground=color)
 
-        # 底栏
-        tk.Label(r, text=f"adb: {self.adb_path.get()}", bg=BG, fg=FG_DIM,
-                 font=("Consolas", 8), anchor="w").pack(fill="x", padx=16, pady=(0, 8))
 
     # ---------- 日志 ----------
     def log(self, msg: str):
@@ -1155,6 +1167,26 @@ class App:
 
         threading.Thread(target=work, daemon=True).start()
 
+    # ---------- 反馈 / 赞赏 ----------
+    def _open_single(self, attr, factory):
+        """同一窗口只留一个：已开着就提到最前，避免连点堆一堆窗口。"""
+        w = getattr(self, attr, None)
+        try:
+            if w is not None and w.winfo_exists():
+                w.deiconify()
+                w.lift()
+                w.focus_force()
+                return
+        except tk.TclError:
+            pass
+        setattr(self, attr, factory(self))
+
+    def on_feedback(self):
+        self._open_single("_win_feedback", FeedbackWindow)
+
+    def on_donate(self):
+        self._open_single("_win_donate", DonateWindow)
+
 
 class DevicePicker(tk.Toplevel):
     """多设备/非车机设备时的选择弹窗。"""
@@ -1196,6 +1228,126 @@ class DevicePicker(tk.Toplevel):
             serial, model, _, _ = self.infos[sel[0]]
             self.chosen, self.chosen_model = serial, model
         self.destroy()
+
+
+class FeedbackWindow(tk.Toplevel):
+    """反馈与联系：显示邮箱，支持一键复制与唤起邮件客户端。"""
+
+    def __init__(self, app: App):
+        super().__init__(app.root)
+        self.app = app
+        self.title("反馈与联系")
+        apply_window_icon(self)
+        self.configure(bg=BG)
+        self.geometry("580x400")
+        self.resizable(False, False)
+        self.transient(app.root)
+
+        box = tk.Frame(self, bg=BG)
+        box.pack(fill="both", expand=True, padx=18, pady=(16, 10))
+
+        tk.Label(box, text="反馈与联系", bg=BG, fg=FG,
+                 font=("Microsoft YaHei UI", 15, "bold")).pack(anchor="w")
+        tk.Label(box, text="用着有问题、想提建议，或者装成功了想说一声，都欢迎发邮件。",
+                 bg=BG, fg=FG_DIM, font=("Microsoft YaHei UI", 9),
+                 justify="left").pack(anchor="w", pady=(6, 12))
+
+        mail = flat_panel(box)
+        mail.pack(fill="x", ipady=10)
+        tk.Label(mail, text="邮箱", bg=PANEL, fg=FG_DIM,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left", padx=(12, 8))
+        self.lbl_mail = tk.Label(mail, text=FEEDBACK_EMAIL, bg=PANEL, fg=ACCENT,
+                                 font=("Consolas", 12, "bold"))
+        self.lbl_mail.pack(side="left")
+        make_button(mail, "复制", self.copy_email).pack(side="right", padx=12)
+
+        tk.Label(box, text="反馈时附上这几项，定位会快很多：", bg=BG, fg=FG,
+                 font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w", pady=(14, 4))
+        for line in ("· 设备栏里的型号与序列号（主界面顶部）",
+                     "· 点过哪几个按钮、完整报错文字",
+                     "· 「日志目录」里对应的 car_logcat_*.txt"):
+            tk.Label(box, text=line, bg=BG, fg=FG_DIM,
+                     font=("Microsoft YaHei UI", 9)).pack(anchor="w", pady=1)
+
+        row = tk.Frame(self, bg=BG)
+        row.pack(fill="x", padx=18, pady=(0, 12))
+        make_button(row, "关闭", self.destroy).pack(side="right")
+        make_button(row, "用邮件客户端发送", self.open_mail, accent=True).pack(side="right", padx=8)
+
+    def _alive(self) -> bool:
+        try:
+            return bool(self.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def copy_email(self):
+        self.clipboard_clear()
+        self.clipboard_append(FEEDBACK_EMAIL)
+        self.lbl_mail.configure(text=f"{FEEDBACK_EMAIL}  已复制")
+
+        def restore():
+            if self._alive():
+                self.lbl_mail.configure(text=FEEDBACK_EMAIL)
+
+        self.after(1600, restore)
+
+    def open_mail(self):
+        from urllib.parse import quote
+        url = f"mailto:{FEEDBACK_EMAIL}?subject={quote('领克车机 ADB 工具反馈')}"
+        try:
+            os.startfile(url)      # Windows：交给系统默认邮件客户端
+        except Exception:
+            self.clipboard_clear()
+            self.clipboard_append(FEEDBACK_EMAIL)
+            messagebox.showinfo(
+                APP_TITLE,
+                "没能唤起邮件客户端，邮箱已复制到剪贴板：\n" + FEEDBACK_EMAIL,
+            )
+
+
+class DonateWindow(tk.Toplevel):
+    """赞赏窗口：并排展示微信 / 支付宝收款码。"""
+
+    def __init__(self, app: App):
+        super().__init__(app.root)
+        self.app = app
+        self.title("赞赏")
+        apply_window_icon(self)
+        self.configure(bg=BG)
+        self.geometry("800x580")
+        self.resizable(False, True)
+        self.transient(app.root)
+        self._imgs = []      # 必须留引用，否则 PhotoImage 会被回收成空白
+
+        head = tk.Frame(self, bg=BG)
+        head.pack(fill="x", padx=18, pady=(14, 6))
+        tk.Label(head, text="赞赏", bg=BG, fg=FG,
+                 font=("Microsoft YaHei UI", 15, "bold")).pack(side="left")
+        tk.Label(head, text="完全自愿，不影响使用和更新", bg=BG, fg=FG_DIM,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left", padx=10)
+
+        row = tk.Frame(self, bg=BG)
+        row.pack(fill="both", expand=True, padx=18, pady=6)
+        for stem, name in (("wechat", "微信"), ("alipay", "支付宝")):
+            card = flat_panel(row)
+            card.pack(side="left", fill="both", expand=True, padx=(0, 8))
+            tk.Label(card, text=name, bg=PANEL, fg=FG,
+                     font=("Microsoft YaHei UI", 11, "bold")).pack(pady=(10, 4))
+            p = asset_path("assets", "donate", stem + ".png")
+            if p:
+                img = tk.PhotoImage(file=p)
+                self._imgs.append(img)
+                tk.Label(card, image=img, bg=PANEL).pack(pady=6)
+            else:
+                tk.Label(card, text=f"未找到收款码图片\nassets\\donate\\{stem}.png",
+                         bg=PANEL, fg=RED, font=("Microsoft YaHei UI", 9),
+                         justify="center").pack(pady=60)
+            tk.Label(card, text="扫码后转账即可", bg=PANEL, fg=FG_DIM,
+                     font=("Microsoft YaHei UI", 9)).pack(pady=(0, 10))
+
+        tk.Label(self, text="如果这个工具帮你少折腾了几次，可以请我喝杯水。",
+                 bg=BG, fg=FG_DIM, font=("Microsoft YaHei UI", 9)).pack(pady=(4, 8))
+        make_button(self, "关闭", self.destroy).pack(anchor="e", padx=18, pady=(0, 14))
 
 
 class AppListWindow(tk.Toplevel):

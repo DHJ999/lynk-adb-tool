@@ -46,6 +46,7 @@
 - 上传进度按 adb 实际传输百分比显示，结束后校验设备端文件大小，避免半截包
 - 一键抓取 logcat 到本地
 - 界面配色跟随系统深浅色，切换后自动重建
+- 内置反馈入口（邮箱一键复制 / 唤起邮件客户端）与赞赏入口（微信、支付宝收款码）
 
 ## 快速开始
 
@@ -127,21 +128,30 @@ release\LynkAdbTool-win64.zip
 本项目使用 [MIT License](LICENSE)。  
 分发的 Android platform-tools 归 Google 所有，遵循 Apache 2.0 许可。
 
+## 反馈与赞赏
+
+**反馈**：用着有问题、想提建议，或者装成功了想说一声，都可以发邮件到
+**hjd2002@yeah.net**；程序底栏的「反馈」按钮里可一键复制邮箱或直接唤起邮件客户端。
+
+反馈时附上设备栏的型号与序列号、点过的按钮和完整报错，以及「日志目录」里对应的
+`car_logcat_*.txt`，定位会快很多。
+
 ## 讨杯水
 
-如果这个工具帮到了你，可以请我喝杯水。完全自愿，不影响使用和更新。
+如果这个工具帮到了你，可以扫码请我喝杯水。完全自愿，不影响使用和更新。
+程序底栏的「赞赏」按钮里也有同样的两张码。
 
 <div align="center">
 
 <table>
   <tr>
     <td align="center">
-      <img src="assets/donate/wechat.jpg" width="240" alt="微信赞赏码"><br>
-      <b>微信</b>
+      <img src="assets/donate/wechat.jpg" width="240" alt="微信收款码"><br>
+      <b>微信（扫码后转账）</b>
     </td>
     <td align="center">
-      <img src="assets/donate/alipay.jpg" width="240" alt="支付宝赞赏码"><br>
-      <b>支付宝</b>
+      <img src="assets/donate/alipay.jpg" width="240" alt="支付宝收款码"><br>
+      <b>支付宝（扫码后转账）</b>
     </td>
   </tr>
 </table>
