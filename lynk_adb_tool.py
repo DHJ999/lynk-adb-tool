@@ -14,6 +14,7 @@
 import os
 import queue
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -26,6 +27,27 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 APP_TITLE = "领克车机 ADB 工具"
 REMOTE_APK = "/data/local/tmp/upload.apk"
 FEEDBACK_EMAIL = "hjd2002@yeah.net"
+
+# 命令终端的预设命令：(按钮名, 模式, 命令)
+#   shell = 车机内执行（adb shell xxx）；adb = 本机 adb 子命令；shot = 走特殊流程（截图并拉回本地）
+ADB_PRESETS = [
+    ("设备信息", "shell", "getprop ro.product.model; getprop ro.build.version.release; "
+                          "getprop ro.build.display.id"),
+    ("分辨率/密度", "shell", "wm size; wm density"),
+    ("电池状态", "shell", "dumpsys battery"),
+    ("存储空间", "shell", "df -h /data /sdcard"),
+    ("前台应用", "shell", "dumpsys activity activities | grep -E 'mResumedActivity|mFocusedApp'"),
+    ("CPU 占用", "shell", "top -n 1 -b -o %CPU,ARGS | head -15"),
+    ("内存占用", "shell", "dumpsys meminfo | head -25"),
+    ("网络地址", "shell", "ip addr show | grep -E 'inet |state'"),
+    ("第三方应用数", "shell", "pm list packages -3 | wc -l"),
+    ("最近崩溃", "shell", "logcat -d -b crash -t 80"),
+    ("亮屏/息屏", "shell", "input keyevent 26"),
+    ("返回桌面", "shell", "input keyevent 3"),
+    ("截图到本地", "shot", ""),
+    ("重连 adb", "adb", "reconnect"),
+    ("adb 版本", "adb", "version"),
+]
 
 # 主题：跟随 Windows 显示模式（注册表 AppsUseLightTheme，0=深色）
 def detect_dark_mode() -> bool:
@@ -749,6 +771,170 @@ class AdbClient:
             self.log(f"✗ 启动失败：{out.strip().splitlines()[-1] if out.strip() else '无输出'}")
         return ok
 
+    # ---------- 自定义命令终端 ----------
+    @staticmethod
+    def _shield_install(cmd: str) -> str:
+        """车机 adbd 会掐掉含 "install" 子串的 shell 命令（返回 error: closed）。
+        终端里用户手打的 pm install 同样会踩，这里统一替换成 ins''tall。"""
+        return re.sub(r"install", "ins''tall", cmd)
+
+    def shell_cmd(self, cmd: str, timeout=120):
+        """在车机内执行一条 shell 命令。返回 (code, 输出)。"""
+        cmd = cmd.strip()
+        if not cmd:
+            return -1, "命令为空"
+        if not self.serial:
+            return -1, "尚未选择设备，请先点「重新检测」"
+        safe = self._shield_install(cmd)
+        return self.run_retry(["shell", safe], timeout=timeout, retries=2, label="命令")
+
+    def adb_cmd(self, cmd: str, timeout=120):
+        """执行 adb 自身的子命令（reconnect / version / forward …，面向设备时自动带 -s）。"""
+        cmd = cmd.strip()
+        if not cmd:
+            return -1, "命令为空"
+        if cmd.startswith("adb "):
+            cmd = cmd[4:].strip()
+        try:
+            args = shlex.split(cmd)
+        except ValueError as e:
+            return -1, f"命令解析失败：{e}"
+        if not args:
+            return -1, "命令为空"
+        # adb shell 后面的部分要原样交给设备端，不能先被 shlex 拆散再拼回去：
+        # 带空格的参数会被 adb 按空格重新拼接，引号就丢了
+        if args[0] == "shell":
+            rest = cmd[cmd.find("shell") + len("shell"):].strip()
+            return self.shell_cmd(rest, timeout=timeout)
+        # 只有面向设备的子命令才需要 -s；kill-server/start-server/devices 等带了会报错
+        global_cmds = {"kill-server", "start-server", "devices", "version",
+                       "help", "connect", "disconnect"}
+        if not self.serial or args[0] in global_cmds:
+            return self._spawn([self.adb] + args, timeout)
+        return self.run_retry(args, timeout=timeout, retries=2, label="命令")
+
+    # ---------- USB 链路稳定性 ----------
+    # 这台车机的 USB gadget 功能集默认是 "carplay_carlife,adb"。车上的 CarPlay/CarLife
+    # 探测服务会周期性重配 gadget（dmesg 里 USB_STATE=DISCONNECTED→CONNECTED→CONFIGURED
+    # 反复刷屏，carplay_cnt 递增），每次重配都会拆掉 adbd 的 FunctionFS 通道
+    # （adbd 日志 "UsbFfsConnection being destroyed"），adb 会话立刻断开。
+    # 典型现象：Windows 里 USB 硬件一直在，只有 adb 掉线。
+    # 把持久配置钉死成 "adb" 后不再被重配，链路稳定。
+    # 这台车（CS11 / DesaySV 平台）本身没有 CarPlay 功能，钉死没有副作用。
+    CARPLAY_CONFIG = "carplay_carlife,adb"
+    ADB_ONLY_CONFIG = "adb"
+
+    def usb_binding(self):
+        """读 USB 配置，判断是否存在被周期性重配导致 adb 掉线的风险。"""
+        code, out = self.run_retry(
+            ["shell", "getprop persist.vendor.usb.config; "
+                       "getprop persist.sys.usb.config; "
+                       "getprop sys.usb.config; getprop sys.usb.state"],
+            timeout=30, retries=2,
+        )
+        lines = [l.strip() for l in (out or "").splitlines()]
+        while len(lines) < 4:
+            lines.append("")
+        info = {
+            "persist_vendor": lines[0],
+            "persist_sys": lines[1],
+            "sys_config": lines[2],
+            "sys_state": lines[3],
+            "risky": False,
+            "reason": "",
+        }
+        persisted = f"{info['persist_vendor']} {info['persist_sys']}".lower()
+        if "carplay" in persisted or "carlife" in persisted:
+            info["risky"] = True
+            info["reason"] = ("USB 功能集含 carplay_carlife：车载探测服务会周期性重配 USB，"
+                              "每次重配都会拆掉 adbd 通道 → adb 掉线（USB 硬件仍在）")
+        elif info["persist_vendor"] != self.ADB_ONLY_CONFIG:
+            info["risky"] = True
+            info["reason"] = f"USB 持久配置不是 adb（当前 {info['persist_vendor'] or '空'}），可能被其他服务改写"
+        return info
+
+    def fix_usb_binding(self):
+        """把 USB 持久配置钉死为纯 adb，消除周期性重配导致的掉线。"""
+        self.log("正在修复 USB 链路配置（钉死为 adb）…")
+        self.run_retry(["shell", f"setprop persist.vendor.usb.config {self.ADB_ONLY_CONFIG}"],
+                       timeout=30, retries=2)
+        self.run_retry(["shell", f"setprop persist.sys.usb.config {self.ADB_ONLY_CONFIG}"],
+                       timeout=30, retries=2)
+        time.sleep(1)
+        info = self.usb_binding()
+        ok = (info["persist_vendor"] == self.ADB_ONLY_CONFIG
+              and info["persist_sys"] == self.ADB_ONLY_CONFIG)
+        if ok:
+            self.log("✓ USB 配置已钉死为 adb，链路重配已消除，adb 不再周期性掉线")
+        else:
+            self.log(f"✗ 配置未生效：persist.vendor.usb.config={info['persist_vendor'] or '空'}")
+        return ok, info
+
+    def restore_usb_binding(self):
+        """还原车机出厂 USB 配置 carplay_carlife,adb（排查其他问题时用）。"""
+        self.log("正在还原车机出厂 USB 配置（carplay_carlife,adb）…")
+        self.run_retry(["shell", f"setprop persist.vendor.usb.config {self.CARPLAY_CONFIG}"],
+                       timeout=30, retries=2)
+        self.run_retry(["shell", f"setprop persist.sys.usb.config {self.CARPLAY_CONFIG}"],
+                       timeout=30, retries=2)
+        time.sleep(1)
+        info = self.usb_binding()
+        ok = self.CARPLAY_CONFIG in info["persist_vendor"]
+        if ok:
+            self.log("✓ 已还原出厂配置；adb 可能重新开始周期性掉线")
+        else:
+            self.log(f"✗ 还原未生效：persist.vendor.usb.config={info['persist_vendor'] or '空'}")
+        return ok, info
+
+    def link_health(self):
+        """采集掉线证据：系统运行时长、adbd 启动点、内核里 USB 重配次数。"""
+        code, out = self.run_retry(
+            ["shell", "cat /proc/uptime; getprop ro.boottime.adbd; "
+                       "dmesg 2>/dev/null | grep -c 'USB_STATE=DISCONNECTED'; "
+                       "dmesg 2>/dev/null | grep -c 'USB_STATE=CONFIGURED'"],
+            timeout=40, retries=2,
+        )
+        lines = [l.strip() for l in (out or "").splitlines()]
+        while len(lines) < 4:
+            lines.append("")
+        try:
+            uptime = float(lines[0].split()[0])
+        except Exception:
+            uptime = 0.0
+        try:
+            adbd_boot = int(float(lines[1])) / 1e9      # ro.boottime.adbd 是纳秒
+        except Exception:
+            adbd_boot = 0.0
+        try:
+            disconnects = int(lines[2])
+        except Exception:
+            disconnects = -1
+        try:
+            configured = int(lines[3])
+        except Exception:
+            configured = -1
+        return {
+            "uptime": uptime,
+            "adbd_boot": adbd_boot,
+            "disconnects": disconnects,   # -1 = dmesg 读不到（普通 shell 受限）
+            "configured": configured,
+        }
+
+    def screenshot(self):
+        """截图并拉回本地 logs/，返回本地路径。"""
+        if not self.serial:
+            self.log("✗ 尚未选择设备，请先点「重新检测」")
+            return ""
+        remote = f"/data/local/tmp/shot_{int(time.time())}.png"
+        self.log("正在截图…")
+        self.run_retry(["shell", f"screencap -p {remote}"], timeout=60, retries=2)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        local = os.path.join(APP_DIR, "logs", f"car_shot_{ts}.png")
+        if self.pull(remote, local):
+            self.cleanup_remote(remote)
+            return local
+        return ""
+
 
 class App:
     def __init__(self, root: tk.Tk):
@@ -778,7 +964,7 @@ class App:
         r = self.root
         r.title(APP_TITLE)
         r.configure(bg=BG)
-        r.geometry("760x620")
+        r.geometry("760x660")
         r.minsize(680, 540)
 
         style = ttk.Style()
@@ -810,6 +996,8 @@ class App:
                                 font=("Microsoft YaHei UI", 10))
         self.lbl_dev.pack(side="left", padx=10)
         make_button(row, "重新检测", self.on_refresh).pack(side="right")
+        self.btn_link = make_button(row, "链路诊断", self.on_link_diag)
+        self.btn_link.pack(side="right", padx=(0, 8))
 
         row2 = tk.Frame(dev, bg=PANEL)
         row2.pack(fill="x", padx=12, pady=(4, 6))
@@ -845,6 +1033,15 @@ class App:
         self.btn_openlog.pack(side="right", padx=(0, 8))
         self.btn_apps = make_button(row4, "④ 应用列表", self.on_apps)
         self.btn_apps.pack(side="right", padx=(0, 8))
+
+        # 命令终端单独一行：六个按钮挤在一行时 760 宽的窗口装不下，
+        # Tk 会把按钮压窄到字都显示不全（"⑤ 命令终端" 变成 "命令终"）
+        row4b = tk.Frame(apk, bg=PANEL)
+        row4b.pack(fill="x", padx=12, pady=(0, 2))
+        self.btn_shell = make_button(row4b, "⑤ 命令终端", self.on_shell)
+        self.btn_shell.pack(side="left")
+        tk.Label(row4b, text="手输 adb 命令 / 常用预设命令", bg=PANEL, fg=FG_DIM,
+                 font=("Microsoft YaHei UI", 8)).pack(side="left", padx=10)
 
         row5 = tk.Frame(apk, bg=PANEL)
         row5.pack(fill="x", padx=12, pady=(0, 4))
@@ -926,6 +1123,8 @@ class App:
         set_enabled(self.btn_logcat, not busy)
         set_enabled(self.btn_openlog, not busy)
         set_enabled(self.btn_apps, not busy)
+        set_enabled(self.btn_shell, not busy)
+        set_enabled(self.btn_link, not busy)
         # 启动按钮有前置条件：有入口才可用（卸载在应用列表窗口里）
         set_enabled(self.btn_launch, (not busy) and bool(self.launch_component))
         if busy:
@@ -1036,10 +1235,52 @@ class App:
                     self.log("⚠ 未找到 aapt2，无法自动解析包名（启动按钮不可用，"
                              "卸载仍可在应用列表里按包名操作）")
                 self._set_busy(False)
+                # 连上就查一次 USB 链路配置：车机默认带 carplay_carlife，
+                # CarPlay 探测会周期性重配 USB gadget 导致 adb 掉线
+                self._auto_check_link()
 
             self.root.after(0, done)
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _auto_check_link(self):
+        """连上就检查 USB 配置；发现会被周期性重配就直接自动修好，不打扰用户。"""
+        def work():
+            try:
+                info = self.client.usb_binding()
+            except Exception:
+                return
+            if not info["risky"]:
+                self.root.after(0, lambda: self._link_report(info, fixed=False))
+                return
+            # 有隐患：直接自动修复（这台车没有 CarPlay，钉死 adb 无副作用）
+            try:
+                ok, info2 = self.client.fix_usb_binding()
+            except Exception:
+                ok, info2 = False, info
+            self.root.after(0, lambda: self._link_report(info2, fixed=True, ok=ok, before=info))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _link_report(self, info, fixed=False, ok=False, before=None):
+        if self.busy:
+            return
+        if fixed:
+            if ok:
+                self.log("✓ USB 链路已自动修复：CarPlay/CarLife 不再抢占 USB，adb 掉线问题消除")
+                self.log(f"  persist.vendor.usb.config: {before['persist_vendor'] or '空'} → adb")
+            else:
+                self.log("⚠ USB 链路自动修复未生效，点「链路诊断」查看详情")
+        else:
+            self.log("✓ USB 链路配置正常（纯 adb，不会被周期性重配）")
+
+    def on_link_diag(self):
+        if self.busy:
+            return
+        if not self.client.serial:
+            messagebox.showwarning(APP_TITLE, "请先连接车机")
+            return
+        self._open_single("_win_link", LinkDiagWindow)
 
     def _boot(self):
         self.log("正在检测 adb 与车机…")
@@ -1127,6 +1368,11 @@ class App:
         if self.busy:
             return
         AppListWindow(self)
+
+    def on_shell(self):
+        if self.busy:
+            return
+        self._open_single("_win_shell", ShellWindow)
 
     def on_logcat(self):
         if self.busy:
@@ -1620,6 +1866,556 @@ class AppListWindow(tk.Toplevel):
         if self.loading:
             self.loading = False
             self.app._set_busy(False)
+        self.destroy()
+
+
+class LinkDiagWindow(tk.Toplevel):
+    """链路诊断：查 USB gadget 配置，一键修复 CarPlay 抢通道导致的 adb 掉线。"""
+
+    def __init__(self, app: App):
+        super().__init__(app.root)
+        self.app = app
+        self._closed = False
+        self.running = False
+
+        self.title("链路诊断")
+        apply_window_icon(self)
+        self.geometry("820x600")
+        self.minsize(720, 500)
+        self.configure(bg=BG)
+        self.transient(app.root)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+        self._build()
+        self.refresh()
+
+    def _build(self):
+        top = tk.Frame(self, bg=BG)
+        top.pack(fill="x", padx=16, pady=(14, 6))
+        tk.Label(top, text="链路诊断", bg=BG, fg=FG,
+                 font=("Microsoft YaHei UI", 16, "bold")).pack(side="left")
+        self.lbl_state = tk.Label(top, text="检查中…", bg=BG, fg=AMBER,
+                                  font=("Microsoft YaHei UI", 9))
+        self.lbl_state.pack(side="right")
+
+        # 结论区
+        self.verdict = flat_panel(self)
+        self.verdict.pack(fill="x", padx=16, pady=4, ipady=6)
+        self.lbl_verdict = tk.Label(
+            self.verdict, text="正在读取 USB 配置…", bg=PANEL, fg=FG,
+            font=("Microsoft YaHei UI", 11, "bold"), anchor="w", justify="left",
+            wraplength=740,
+        )
+        self.lbl_verdict.pack(fill="x", padx=12, pady=(8, 2))
+        self.lbl_reason = tk.Label(
+            self.verdict, text="", bg=PANEL, fg=FG_DIM,
+            font=("Microsoft YaHei UI", 9), anchor="w", justify="left",
+            wraplength=740,
+        )
+        self.lbl_reason.pack(fill="x", padx=12, pady=(0, 8))
+
+        # 明细区
+        box = flat_panel(self)
+        box.pack(fill="both", expand=True, padx=16, pady=4)
+        tk.Label(box, text="明细", bg=PANEL, fg=FG_DIM,
+                 font=("Microsoft YaHei UI", 9), anchor="w").pack(
+            fill="x", padx=12, pady=(8, 0))
+        self.detail = scrolledtext.ScrolledText(
+            box, bg=PANEL2, fg=FG, insertbackground=FG, relief="flat",
+            font=("Consolas", 9), state="disabled", wrap="word", height=12,
+        )
+        self.detail.pack(fill="both", expand=True, padx=12, pady=(2, 12))
+        for tag, color in (("ok", ACCENT), ("err", RED), ("warn", AMBER), ("dim", FG_DIM)):
+            self.detail.tag_config(tag, foreground=color)
+
+        # 按钮区
+        foot = tk.Frame(self, bg=BG)
+        foot.pack(side="bottom", fill="x", padx=16, pady=(4, 10))
+        self.btn_fix = make_button(foot, "一键修复（钉死为 adb）", self.do_fix, accent=True)
+        self.btn_fix.pack(side="left")
+        self.btn_restore = make_button(foot, "还原出厂配置", self.do_restore)
+        self.btn_restore.pack(side="left", padx=8)
+        self.btn_refresh = make_button(foot, "重新检查", self.refresh)
+        self.btn_refresh.pack(side="left", padx=8)
+        make_button(foot, "关闭", self._close).pack(side="right")
+
+        tk.Label(
+            self,
+            text="原理：车机 USB 功能集默认含 carplay_carlife，车载探测服务会周期性重配 USB gadget，"
+                 "每次重配都会拆掉 adbd 通道 → adb 掉线（USB 硬件仍在）。钉死为 adb 后不再被重配。"
+                 "本车没有 CarPlay 功能，钉死无副作用；工具在连上设备时会自动执行。",
+            bg=BG, fg=FG_DIM, font=("Microsoft YaHei UI", 8),
+            wraplength=780, justify="left", anchor="w",
+        ).pack(side="bottom", fill="x", padx=16, pady=(0, 4))
+
+    # ---------- 状态 ----------
+    def _alive(self) -> bool:
+        if self._closed:
+            return False
+        try:
+            return bool(self.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def _append(self, text: str, tag: str = ""):
+        if not self._alive():
+            return
+        self.detail.configure(state="normal")
+        self.detail.insert("end", text if text.endswith("\n") else text + "\n", tag)
+        self.detail.see("end")
+        self.detail.configure(state="disabled")
+
+    def _clear(self):
+        if not self._alive():
+            return
+        self.detail.configure(state="normal")
+        self.detail.delete("1.0", "end")
+        self.detail.configure(state="disabled")
+
+    # ---------- 检查 ----------
+    def refresh(self):
+        if self.running:
+            return
+        if self.app.busy:
+            self.lbl_state.configure(text="主窗口有操作进行中")
+            return
+        self.running = True
+        self.lbl_state.configure(text="检查中…")
+        set_enabled(self.btn_refresh, False)
+
+        def work():
+            try:
+                info = self.app.client.usb_binding()
+                health = self.app.client.link_health()
+            except Exception as e:
+                info, health = None, {"error": str(e)}
+            if self._alive():
+                self.after(0, lambda: self._done(info, health))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _done(self, info, health):
+        self.running = False
+        if not self._alive():
+            return
+        set_enabled(self.btn_refresh, True)
+        self._clear()
+
+        if info is None:
+            self.lbl_state.configure(text="检查失败")
+            self.lbl_verdict.configure(text="✗ 读取失败", fg=RED)
+            self.lbl_reason.configure(text=str(health.get("error", "")))
+            return
+
+        if info["risky"]:
+            self.lbl_verdict.configure(text="⚠ 存在 adb 掉线隐患", fg=AMBER)
+            self.lbl_reason.configure(text=info["reason"])
+            self.lbl_state.configure(text="需要修复")
+        else:
+            self.lbl_verdict.configure(text="✓ 链路配置正常", fg=ACCENT)
+            self.lbl_reason.configure(text="USB 功能集为纯 adb，不会被 CarPlay 探测重配")
+            self.lbl_state.configure(text="正常")
+
+        self._append("—— USB 配置 ——", "dim")
+        self._append(f"persist.vendor.usb.config = {info['persist_vendor'] or '(空)'}",
+                     "err" if "carplay" in info["persist_vendor"].lower() else "ok")
+        self._append(f"persist.sys.usb.config    = {info['persist_sys'] or '(空)'}",
+                     "err" if "carplay" in info["persist_sys"].lower() else "ok")
+        self._append(f"sys.usb.config            = {info['sys_config'] or '(空)'}")
+        self._append(f"sys.usb.state             = {info['sys_state'] or '(空)'}")
+
+        self._append("")
+        self._append("—— 运行状态 ——", "dim")
+        if health.get("uptime"):
+            self._append(f"车机运行时长   = {health['uptime'] / 60:.1f} 分钟")
+        if health.get("adbd_boot"):
+            self._append(f"adbd 启动于     = 开机后 {health['adbd_boot']:.1f} 秒"
+                         "（数值不变说明 adbd 没重启过）")
+        if health.get("disconnects") is not None and health["disconnects"] >= 0:
+            self._append(f"USB 断开计数   = {health['disconnects']} 次（dmesg）", 
+                         "warn" if health["disconnects"] > 3 else "")
+            self._append(f"USB 配置完成数 = {health['configured']} 次（dmesg）")
+        else:
+            self._append("USB 断开计数   = 读不到（普通 shell 无权读 dmesg）", "dim")
+
+    # ---------- 修复 ----------
+    def do_fix(self):
+        # 本车没有 CarPlay，钉死为 adb 无副作用，不再二次确认
+        if self.running or self.app.busy:
+            return
+        self._run_fix()
+
+    def do_restore(self):
+        if self.running or self.app.busy:
+            return
+        if not messagebox.askyesno(
+            APP_TITLE,
+            "还原车机出厂 USB 配置（carplay_carlife,adb）？\n\n"
+            "还原后 adb 可能重新开始周期性掉线。",
+        ):
+            return
+        self._run_fix(restore=True)
+
+    def _run_fix(self, restore=False):
+        self.running = True
+        self.app._set_busy(True)
+        set_enabled(self.btn_fix, False)
+        set_enabled(self.btn_restore, False)
+        self.lbl_state.configure(text="正在恢复…" if restore else "正在修复…")
+
+        def work():
+            try:
+                if restore:
+                    ok, info = self.app.client.restore_usb_binding()
+                else:
+                    ok, info = self.app.client.fix_usb_binding()
+            except Exception as e:
+                ok, info = False, {"error": str(e)}
+
+            def done():
+                self.running = False
+                self.app._set_busy(False)
+                if not self._alive():
+                    return
+                set_enabled(self.btn_fix, True)
+                set_enabled(self.btn_restore, True)
+                self.refresh()
+
+            self.after(0, done)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _close(self):
+        self._closed = True
+        self.destroy()
+
+
+class ShellWindow(tk.Toplevel):
+    """命令终端：手输 adb 命令 + 一排预设命令，输出只在本窗口内滚动。"""
+
+    def __init__(self, app: App):
+        super().__init__(app.root)
+        self.app = app
+        self.running = False
+        self._closed = False
+        self._owns_busy = False
+        self.mode_var = tk.StringVar(value="shell")
+        self.cmd_var = tk.StringVar()
+        self._history = []          # 本次会话输入过的命令，↑/↓ 翻
+        self._hist_pos = -1
+
+        self.title("ADB 命令终端")
+        apply_window_icon(self)
+        self.geometry("900x680")
+        self.minsize(760, 540)
+        self.configure(bg=BG)
+        self.transient(app.root)
+        self.protocol("WM_DELETE_WINDOW", self._close)
+
+        self._build()
+        self._append_info(self._target_text())
+        self._append_info("模式 shell = 车机内执行（自动走 adb shell）；模式 adb = 本机 adb 子命令")
+        self._append_info("提示：shell 模式里 pm install 会自动改写成 ins''tall，绕过车机 adbd 过滤")
+
+    # ---------- UI ----------
+    def _build(self):
+        top = tk.Frame(self, bg=BG)
+        top.pack(fill="x", padx=16, pady=(14, 6))
+        tk.Label(top, text="命令终端", bg=BG, fg=FG,
+                 font=("Microsoft YaHei UI", 16, "bold")).pack(side="left")
+        self.lbl_target = tk.Label(top, text=self._target_short(), bg=BG, fg=FG_DIM,
+                                   font=("Microsoft YaHei UI", 9))
+        self.lbl_target.pack(side="right")
+
+        # 预设命令区：按钮自动换行，宽度按窗口宽度算列数
+        preset = flat_panel(self)
+        preset.pack(fill="x", padx=16, pady=4, ipady=6)
+        tk.Label(preset, text="预设命令", bg=PANEL, fg=FG_DIM,
+                 font=("Microsoft YaHei UI", 9), anchor="w").pack(
+            fill="x", padx=12, pady=(6, 2))
+        self.preset_box = tk.Frame(preset, bg=PANEL)
+        self.preset_box.pack(fill="x", padx=8, pady=(0, 6))
+        self._preset_buttons = []
+        self._preset_cols = 0
+        self._reflow_presets(5)
+        self.bind("<Configure>", self._on_resize)
+
+        # 输入行
+        entry_box = flat_panel(self)
+        entry_box.pack(fill="x", padx=16, pady=4, ipady=8)
+        row = tk.Frame(entry_box, bg=PANEL)
+        row.pack(fill="x", padx=12, pady=(8, 4))
+        tk.Label(row, text="模式", bg=PANEL, fg=FG_DIM,
+                 font=("Microsoft YaHei UI", 9)).pack(side="left")
+        self.cb_mode = ttk.Combobox(row, textvariable=self.mode_var, state="readonly",
+                                    values=("shell", "adb"), width=7,
+                                    font=("Consolas", 9))
+        self.cb_mode.pack(side="left", padx=8)
+        self.entry = tk.Entry(row, textvariable=self.cmd_var, bg=PANEL2, fg=FG,
+                              insertbackground=FG, relief="flat", font=("Consolas", 10))
+        self.entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.entry.bind("<Return>", lambda _e: self.on_run())
+        self.entry.bind("<Up>", self._hist_up)
+        self.entry.bind("<Down>", self._hist_down)
+        self.cb_mode.bind("<<ComboboxSelected>>", lambda _e: self.entry.focus_set())
+
+        self.btn_run = make_button(row, "执行", self.on_run, accent=True)
+        self.btn_run.pack(side="left")
+        self.btn_clear = make_button(row, "清屏", self.clear)
+        self.btn_clear.pack(side="left", padx=8)
+
+        row2 = tk.Frame(entry_box, bg=PANEL)
+        row2.pack(fill="x", padx=12, pady=(0, 6))
+        tk.Label(row2, text="例：shell 模式  ls -l /sdcard   ｜   adb 模式  forward tcp:8080 tcp:8080",
+                 bg=PANEL, fg=FG_DIM, font=("Microsoft YaHei UI", 8), anchor="w").pack(
+            side="left")
+
+        # 输出区
+        out = flat_panel(self)
+        out.pack(fill="both", expand=True, padx=16, pady=(4, 4))
+        head = tk.Frame(out, bg=PANEL)
+        head.pack(fill="x", padx=12, pady=(8, 0))
+        tk.Label(head, text="输出", bg=PANEL, fg=FG_DIM,
+                 font=("Microsoft YaHei UI", 9), anchor="w").pack(side="left")
+        self.lbl_state = tk.Label(head, text="就绪", bg=PANEL, fg=FG_DIM,
+                                  font=("Microsoft YaHei UI", 9))
+        self.lbl_state.pack(side="right")
+        self.outbox = scrolledtext.ScrolledText(
+            out, bg=PANEL2, fg=FG, insertbackground=FG, relief="flat",
+            font=("Consolas", 9), state="disabled", wrap="none", height=16,
+        )
+        self.outbox.pack(fill="both", expand=True, padx=12, pady=(2, 12))
+        for tag, color in (("ok", ACCENT), ("err", RED), ("warn", AMBER),
+                           ("cmd", HOVER_ACCENT), ("info", FG_DIM)):
+            self.outbox.tag_config(tag, foreground=color)
+
+        # 底栏
+        foot = tk.Frame(self, bg=BG)
+        foot.pack(side="bottom", fill="x", padx=16, pady=(0, 8))
+        make_button(foot, "复制输出", self.copy_output).pack(side="right")
+        make_button(foot, "关闭", self._close).pack(side="right", padx=(0, 8))
+        self.entry.focus_set()
+
+    def _target_short(self) -> str:
+        c = self.app.client
+        if not c.serial:
+            return "未连接设备"
+        return f"{c.model or '未知型号'}  ({c.serial})"
+
+    def _target_text(self) -> str:
+        return f"目标设备：{self._target_short()}"
+
+    def _reflow_presets(self, cols: int):
+        if cols == self._preset_cols:
+            return
+        self._preset_cols = cols
+        for b in self._preset_buttons:
+            b.destroy()
+        self._preset_buttons = []
+        for i, (label, mode, cmd) in enumerate(ADB_PRESETS):
+            b = make_button(self.preset_box, label,
+                            lambda m=mode, c=cmd, l=label: self.on_preset(m, c, l))
+            b.grid(row=i // cols, column=i % cols, padx=3, pady=3, sticky="ew")
+            self._preset_buttons.append(b)
+        for c in range(cols):
+            self.preset_box.grid_columnconfigure(c, weight=1)
+
+    def _on_resize(self, event):
+        if event.widget is not self:
+            return
+        # 每个按钮大约占 110px，最少 3 列
+        self._reflow_presets(max(3, min(7, event.width // 115)))
+
+    # ---------- 输出 ----------
+    def _alive(self) -> bool:
+        if self._closed:
+            return False
+        try:
+            return bool(self.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def _append(self, text: str, tag: str = ""):
+        if not self._alive():
+            return
+        self.outbox.configure(state="normal")
+        ts = time.strftime("%H:%M:%S")
+        if tag == "cmd":
+            self.outbox.insert("end", f"\n[{ts}] {text}\n", tag)
+        elif tag == "info":
+            self.outbox.insert("end", f"[{ts}] {text}\n", tag)
+        else:
+            self.outbox.insert("end", text if text.endswith("\n") else text + "\n", tag)
+        self.outbox.see("end")
+        self.outbox.configure(state="disabled")
+
+    def _append_info(self, text: str):
+        self._append(text, "info")
+
+    def clear(self):
+        if not self._alive():
+            return
+        self.outbox.configure(state="normal")
+        self.outbox.delete("1.0", "end")
+        self.outbox.configure(state="disabled")
+
+    def copy_output(self):
+        if not self._alive():
+            return
+        text = self.outbox.get("1.0", "end").strip()
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.lbl_state.configure(text=f"已复制 {len(text)} 字符")
+
+    # ---------- 历史 ----------
+    def _hist_up(self, _event=None):
+        if not self._history:
+            return "break"
+        self._hist_pos = max(0, self._hist_pos - 1) if self._hist_pos >= 0 else len(self._history) - 1
+        self.cmd_var.set(self._history[self._hist_pos])
+        self.entry.icursor("end")
+        return "break"
+
+    def _hist_down(self, _event=None):
+        if not self._history:
+            return "break"
+        self._hist_pos += 1
+        if self._hist_pos >= len(self._history):
+            self._hist_pos = -1
+            self.cmd_var.set("")
+        else:
+            self.cmd_var.set(self._history[self._hist_pos])
+        self.entry.icursor("end")
+        return "break"
+
+    # ---------- 执行 ----------
+    def on_preset(self, mode: str, cmd: str, label: str):
+        if self.running:
+            return
+        if getattr(self.app, "busy", False):
+            self._append("⚠ 主窗口有操作进行中（上传/安装/抓日志），等它结束再执行命令", "warn")
+            return
+        if mode == "shot":
+            self._run_shot()
+            return
+        if mode:
+            self.mode_var.set(mode)
+        self.cmd_var.set(cmd)
+        self.on_run()
+
+    def on_run(self):
+        if self.running:
+            self.lbl_state.configure(text="上一条命令还在执行，请稍候")
+            return
+        if getattr(self.app, "busy", False):
+            self._append("⚠ 主窗口有操作进行中（上传/安装/抓日志），等它结束再执行命令", "warn")
+            return
+        cmd = self.cmd_var.get().strip()
+        if not cmd:
+            return
+        mode = self.mode_var.get()
+        # 用户在输入框里写了 "adb shell ..." 前缀时自动纠正模式，避免重复拼 shell
+        if cmd.startswith("adb "):
+            rest = cmd[4:].strip()
+            if rest == "shell":
+                self.mode_var.set("shell")
+                self._append("⚠ 请输入 shell 后面的部分，例如 ls -l /sdcard", "warn")
+                self.entry.focus_set()
+                return
+            if rest.startswith("shell "):
+                # 去掉 shell 关键字，剩下才是要交给设备端的命令
+                mode, cmd = "shell", rest[len("shell "):].strip()
+            else:
+                mode, cmd = "adb", rest
+            self.mode_var.set(mode)
+            self.cmd_var.set(cmd)
+
+        if not self.app.client.serial:
+            self._append("✗ 尚未选择设备，请回到主窗口点「重新检测」", "err")
+            return
+
+        self._history.append(cmd)
+        if len(self._history) > 200:
+            self._history = self._history[-200:]
+        self._hist_pos = -1
+        self._append(f"[{mode}] {cmd}", "cmd")
+        self._set_running(True)
+
+        def work():
+            try:
+                if mode == "shell":
+                    code, out = self.app.client.shell_cmd(cmd)
+                else:
+                    code, out = self.app.client.adb_cmd(cmd)
+            except Exception as e:
+                code, out = -1, f"执行异常：{e}"
+            self.after(0, lambda: self._done(code, out))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _run_shot(self):
+        self._set_running(True)
+        self._append("截图 → 拉回本地 logs/ …", "cmd")
+
+        def work():
+            try:
+                local = self.app.client.screenshot()
+                code, out = (0, local) if local else (-1, "截图失败（详见主日志）")
+            except Exception as e:
+                code, out = -1, f"执行异常：{e}"
+            self.after(0, lambda: self._done(code, out, is_shot=True))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _done(self, code, out, is_shot=False):
+        if not self._alive():
+            return
+        self._set_running(False)
+        if is_shot:
+            if code == 0 and out:
+                self._append(f"✓ 已保存：{out}", "ok")
+            else:
+                self._append(f"✗ {out}", "err")
+            self.app.log(f"终端截图：{out}")
+            return
+        body = (out or "").rstrip()
+        if body:
+            tag = "" if code == 0 else "err"
+            self._append(body, tag)
+        else:
+            self._append("（无输出）", "info")
+        if code == 0:
+            self.lbl_state.configure(text="完成")
+        else:
+            self.lbl_state.configure(text=f"退出码 {code}")
+            if "车机未连接" in (out or "") or "尚未选择设备" in (out or ""):
+                self._append("⚠ 链路可能已断开，回主窗口点「重新检测」", "warn")
+        self.entry.focus_set()
+
+    def _set_running(self, running: bool):
+        self.running = running
+        set_enabled(self.btn_run, not running)
+        for b in self._preset_buttons:
+            set_enabled(b, not running)
+        if running:
+            self.lbl_state.configure(text="执行中…")
+            # 与主窗口互斥：终端和上传/安装共用同一个 AdbClient 与同一条 USB 通道，
+            # 并发会让 push 进度和命令输出互相穿插甚至断链
+            self.app._set_busy(True)
+            self._owns_busy = True
+        else:
+            self.lbl_state.configure(text="就绪")
+            self._release_busy()
+
+    def _release_busy(self):
+        if getattr(self, "_owns_busy", False):
+            self._owns_busy = False
+            self.app._set_busy(False)
+
+    def _close(self):
+        self._closed = True
+        # 命令还在跑就关窗：必须把主窗口的互斥还回去，否则主界面按钮永久禁用
+        self._release_busy()
         self.destroy()
 
 
