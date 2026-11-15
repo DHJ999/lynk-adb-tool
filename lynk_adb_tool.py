@@ -759,6 +759,67 @@ class AdbClient:
         self.log(f"✗ 拉取失败：{out.strip().splitlines()[-1] if out.strip() else '无输出'}")
         return False
 
+    # ---------- 导出 APK ----------
+    def apk_paths(self, pkg: str):
+        """查包的 APK 路径列表。split APK 会返回多个（base + config.xx）。"""
+        code, out = self.run_retry(
+            ["shell", "pm", "path", pkg], timeout=30, retries=2
+        )
+        paths = []
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("package:"):
+                p = line.split(":", 1)[1].strip()
+                if p:
+                    paths.append(p)
+        return paths
+
+    def pull_apk(self, pkg: str, dest_dir: str, progress=None):
+        """导出包的 APK 到电脑目录。返回 (成功与否, 保存路径列表 或 错误信息)。
+
+        split APK（base.apk + config.arm64_v8a.apk 等）会全部拉回，
+        命名为 {包名}_{文件原名}，放进 dest_dir。
+        """
+        if not self.serial:
+            return False, "尚未选择设备，请先点「重新检测」"
+        # 包名合法性校验（与 uninstall 同一套规则），防止拼接命令被注入
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+", pkg or ""):
+            return False, f"包名不合法：{pkg!r}"
+
+        paths = self.apk_paths(pkg)
+        if not paths:
+            return False, "查不到 APK 路径（包可能已卸载，或 pm path 无返回）"
+
+        os.makedirs(dest_dir, exist_ok=True)
+        saved = []
+        total = len(paths)
+        for i, remote in enumerate(paths, 1):
+            name = remote.rstrip("/").split("/")[-1] or "base.apk"
+            local = os.path.join(dest_dir, f"{pkg}_{name}")
+            if progress:
+                progress(i, total, name)
+            # 大 APK 拉取超时放宽到 600s；断链由 run_retry 自动重连重试
+            code, out = self.run_retry(
+                ["pull", remote, local], timeout=600, retries=3
+            )
+            if code == 0 and os.path.isfile(local):
+                size_kb = os.path.getsize(local) / 1024
+                self.log(f"✓ 已导出（{i}/{total}）：{local}（{size_kb:.0f} KB）")
+                saved.append(local)
+            else:
+                reason = out.strip().splitlines()[-1] if out.strip() else "无输出"
+                # 清掉半截文件，避免误用
+                try:
+                    if os.path.isfile(local):
+                        os.remove(local)
+                except OSError:
+                    pass
+                return False, f"拉取 {name} 失败：{reason}"
+
+        if progress:
+            progress(total, total, "完成")
+        return True, saved
+
     def launch(self, component):
         self.log(f"启动 {component} …")
         code, out = self.run_retry(
@@ -1715,6 +1776,8 @@ class AppListWindow(tk.Toplevel):
             row, "卸载此包名", self.uninstall, danger=True
         )
         self.btn_uninstall.pack(side="left", padx=8)
+        self.btn_export = make_button(row, "导出 APK", self.export_apk)
+        self.btn_export.pack(side="left", padx=(0, 8))
         make_button(row, "复制包名", self.copy_pkg).pack(side="left")
         # 必须走 _close：直接 destroy 不会置 _closed，加载中关闭会让进度回调
         # 一直往已销毁的控件上写字（一堆 TclError）
@@ -1831,6 +1894,7 @@ class AppListWindow(tk.Toplevel):
             return
         self.app._set_busy(True)   # 与主窗口互斥
         set_enabled(self.btn_uninstall, False)
+        set_enabled(self.btn_export, False)
         self.status.configure(text=f"正在卸载 {pkg}…")
         threading.Thread(
             target=self._uninstall_worker, args=(pkg,), daemon=True
@@ -1846,12 +1910,73 @@ class AppListWindow(tk.Toplevel):
         if not self._alive():
             return
         set_enabled(self.btn_uninstall, True)
+        set_enabled(self.btn_export, True)
         if ok:
             self.app.client.label_cache.pop(pkg, None)
             self.status.configure(text=f"已卸载 {pkg}")
             self.refresh()
         else:
             self.status.configure(text=f"卸载失败：{pkg}（详见主日志）")
+
+    # ---------- 导出 APK ----------
+    def export_apk(self):
+        pkg = self.pkg_var.get().strip() or self._selected_pkg()
+        if not pkg:
+            messagebox.showwarning(APP_TITLE, "请先选择应用，或输入包名")
+            return
+        if self.loading or self.app.busy:
+            self.status.configure(text="有操作进行中，请稍后再试")
+            return
+        dest = filedialog.askdirectory(title=f"选择导出目录（{pkg}）")
+        if not dest:
+            return
+        self.app._set_busy(True)
+        set_enabled(self.btn_export, False)
+        set_enabled(self.btn_uninstall, False)
+        self.status.configure(text=f"正在导出 {pkg} …")
+        threading.Thread(
+            target=self._export_worker, args=(pkg, dest), daemon=True
+        ).start()
+
+    def _export_progress(self, i, total, name):
+        if self._closed:
+            return
+
+        def upd():
+            if self._alive():
+                self.status.configure(text=f"正在导出 {i}/{total}：{name}")
+
+        self.after(0, upd)
+
+    def _export_worker(self, pkg: str, dest: str):
+        try:
+            ok, result = self.app.client.pull_apk(
+                pkg, dest, progress=self._export_progress
+            )
+        except Exception as e:
+            ok, result = False, f"导出异常：{e}"
+        if not self._closed:
+            self.after(0, lambda: self._export_done(pkg, dest, ok, result))
+
+    def _export_done(self, pkg: str, dest: str, ok: bool, result):
+        self.app._set_busy(False)   # 无论窗口是否还在都要释放主窗口互斥
+        if not self._alive():
+            return
+        set_enabled(self.btn_export, True)
+        set_enabled(self.btn_uninstall, True)
+        if ok:
+            files = result  # 保存路径列表
+            n = len(files)
+            total_mb = sum(os.path.getsize(f) for f in files) / (1024 * 1024)
+            self.status.configure(
+                text=f"✓ 已导出 {n} 个文件（{total_mb:.1f} MB）→ {dest}"
+            )
+            self.app.log(f"✓ 导出完成：{pkg} → {dest}（{n} 个文件）")
+            if messagebox.askyesno(APP_TITLE, f"导出完成（{n} 个文件）。\n\n打开导出目录？"):
+                subprocess.Popen(["explorer", os.path.normpath(dest)])
+        else:
+            self.status.configure(text=f"导出失败：{result}")
+            self.app.log(f"✗ 导出失败：{pkg}：{result}")
 
     def _alive(self) -> bool:
         if self._closed:
